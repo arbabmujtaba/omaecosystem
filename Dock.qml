@@ -617,6 +617,7 @@ Item {
           spacing: 0
 
           Text {
+            textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
             width: parent.width
             text: root.device.name || "Phone"
             color: root.fg
@@ -626,6 +627,7 @@ Item {
             font.bold: true
           }
           Text {
+            textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
             width: parent.width
             elide: Text.ElideRight
             color: root.dim
@@ -720,12 +722,14 @@ Item {
           spacing: Style.space(9)
 
           Text {
+            textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
             text: "󰄜"
             color: root.accent
             font.family: root.fontFamily
             font.pixelSize: Style.space(34)
           }
           Text {
+            textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
             width: parent.width
             wrapMode: Text.WordWrap
             text: root.phaseCode === "missing-tool" ? "One thing to install" : "Let's connect your phone"
@@ -745,6 +749,7 @@ Item {
             border.width: 1
             border.color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.5)
             Text {
+              textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
               id: usbTip
               anchors.centerIn: parent
               width: parent.width - Style.space(14)
@@ -776,6 +781,7 @@ Item {
                 border.width: 1
                 border.color: Qt.rgba(1, 1, 1, 0.35)
                 Text {
+                  textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
                   anchors.centerIn: parent
                   text: String(index + 1)
                   color: Qt.rgba(1, 1, 1, 0.8)
@@ -784,6 +790,7 @@ Item {
                 }
               }
               Text {
+                textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
                 width: guide.width - Style.space(24)
                 wrapMode: Text.WordWrap
                 text: modelData
@@ -802,6 +809,7 @@ Item {
             scale: guideMouse.pressed ? 0.96 : 1
             Behavior on scale { NumberAnimation { duration: 90 } }
             Text {
+              textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
               id: guideRetry
               anchors.centerIn: parent
               text: "󰑐  Try again"
@@ -826,6 +834,7 @@ Item {
           spacing: Style.space(14)
 
           Text {
+            textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
             anchors.horizontalCenter: parent.horizontalCenter
             text: root.phase === "error" ? "󰀦" : "󰄜"
             property real bob: 0
@@ -866,6 +875,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             wrapMode: Text.WordWrap
@@ -879,6 +889,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
             visible: text !== ""
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
@@ -901,6 +912,7 @@ Item {
             scale: retryMouse.pressed ? 0.96 : 1
             Behavior on scale { NumberAnimation { duration: 90 } }
             Text {
+              textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
               id: retryLabel
               anchors.centerIn: parent
               text: (root.phase === "stopped" ? "󰑐  Reconnect" : "󰑐  Try again")
@@ -964,6 +976,7 @@ Item {
 
       // -- status line ---------------------------------------------------------
       Text {
+        textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
         x: root.pad
         id: toastLine
         y: root.toastY + toastNudge
@@ -1004,6 +1017,7 @@ Item {
     Behavior on scale { NumberAnimation { duration: 90 } }
     Behavior on color { ColorAnimation { duration: 120 } }
     Text {
+      textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
       anchors.centerIn: parent
       text: ib.glyph
       color: ibMouse.containsMouse ? root.fg : root.dim
@@ -1133,6 +1147,7 @@ Item {
         anchors.horizontalCenter: parent.horizontalCenter
         width: Style.space(24); height: Style.space(24)
         Text {
+          textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
           anchors.centerIn: parent
           visible: !tile.busy
           text: tile.glyph
@@ -1165,6 +1180,7 @@ Item {
         }
       }
       Text {
+        textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
         width: parent.width
         horizontalAlignment: Text.AlignHCenter
         elide: Text.ElideRight
@@ -1175,6 +1191,7 @@ Item {
         font.bold: true
       }
       Text {
+        textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
         width: parent.width
         horizontalAlignment: Text.AlignHCenter
         elide: Text.ElideRight

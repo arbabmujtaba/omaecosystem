@@ -12,6 +12,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -605,6 +606,36 @@ class OldConfigs(unittest.TestCase):
         cfg = self.load("this is not bash (\nPHONE_ADDR=10.0.0.2:5555\n")
         self.assertEqual(cfg["bt_mac"], "")
         self.assertEqual(cfg["hotspot_wait"], 40)
+
+
+class Markup(unittest.TestCase):
+    """Clipboard text, file names and the phone's name are untrusted. Qt's
+    default AutoText renders them as HTML, so `<img src=http://…>` in copied
+    text would make the shell fetch that URL. Every Text must be plain."""
+
+    def test_every_text_is_plain(self):
+        for name in ("Dock.qml", "BarWidget.qml"):
+            with open(os.path.join(ROOT, name)) as f:
+                lines = f.read().splitlines()
+            for i, line in enumerate(lines):
+                if re.match(r"^\s*(Text|Label|TextEdit|TextArea)\s*\{", line):
+                    depth, block = 0, []
+                    for l in lines[i:]:
+                        block.append(l)
+                        depth += l.count("{") - l.count("}")
+                        if depth <= 0:
+                            break
+                    own = [l for l in block if l.startswith(re.match(r"^\s*", line).group(0) + "  ")
+                           and not l.startswith(re.match(r"^\s*", line).group(0) + "    ")]
+                    self.assertTrue(any("textFormat: Text.PlainText" in l for l in own),
+                                    f"{name}:{i + 1} Text without textFormat: Text.PlainText")
+
+    def test_no_html_rendering_anywhere(self):
+        for name in ("Dock.qml", "BarWidget.qml"):
+            with open(os.path.join(ROOT, name)) as f:
+                text = f.read()
+            for bad in ("Text.RichText", "Text.StyledText", "Text.AutoText", "Text.MarkdownText"):
+                self.assertNotIn(bad, text, f"{bad} in {name}")
 
 
 class Manifest(unittest.TestCase):
