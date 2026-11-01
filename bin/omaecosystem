@@ -1,0 +1,851 @@
+#!/usr/bin/python3
+"""omaecosystem — engine behind the OmaEcosystem Omarchy plugin.
+
+The dock (Dock.qml) draws a phone frame on the right of the screen. This helper
+connects to the phone over ADB, runs scrcpy borderless and pins its window
+exactly inside the frame's screen hole, and does the one-click actions.
+
+    omaecosystem probe                       connect, print the phone's details (JSON)
+    omaecosystem mirror --namespace NS --x X --y Y --w W --h H [--max-size N] [--screen-off]
+                                          run the docked mirror until stdin closes or
+                                          `quit` is written; `rect X Y W H` moves it
+    omaecosystem clip-to-phone               laptop clipboard -> phone clipboard
+                                          (files/images in the clipboard are sent as files)
+    omaecosystem clip-from-phone             phone clipboard -> laptop clipboard
+    omaecosystem send-files [PATH...]        push files to the phone's Download folder
+                                          (no paths: pick them in a file dialog)
+    omaecosystem key back|home|recents|power
+    omaecosystem screenshot                  phone screenshot -> ~/Pictures/Phone + laptop clipboard
+    omaecosystem open-link [URL]             open a link (default: the laptop clipboard) on the phone
+    omaecosystem notifications               pull down the phone's notification shade
+    omaecosystem hotspot                     turn on the phone's hotspot and join it (phone-hotspot)
+
+Every command takes --serial to skip device discovery. One-shot commands print a
+JSON result as their last stdout line; `mirror` prints one JSON event per line.
+
+Settings come from phone-mirror's config, ${XDG_CONFIG_HOME:-~/.config}/phone-mirror/config:
+PHONE_SERIAL, PHONE_ADDR, PHONE_AUDIO and PHONE_SCRCPY_ARGS work as in phone-open.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+
+WINDOW_TITLE = "OmaEcosystem"
+RULE_VAR = "omaecosystem_rule"
+DEVICE_SERVER = "/data/local/tmp/omaecosystem-server.jar"
+PUSH_DIR = "/sdcard/Download"
+BLEED = 2  # the window overhangs the screen hole by this much; the bezel hides it
+KEYCODES = {"back": "4", "home": "3", "recents": "187", "power": "26"}
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+STATE_DIR = os.path.join(RUNTIME, "phone-mirror")
+LOG_PATH = os.path.join(STATE_DIR, "omaecosystem.log")
+PID_PATH = os.path.join(STATE_DIR, "omaecosystem.pid")
+CACHE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "omaecosystem")
+CONFIG_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "phone-mirror", "config")
+
+NOT_REACHABLE = ("No phone found. Plug it in with a USB cable (fastest), or turn on "
+                 "Wireless debugging on the phone.")
+
+
+class DockError(Exception):
+    """An error for the user. `code` lets the dock show the right setup help:
+    missing-tool, no-device, unauthorized, or "" for anything else."""
+
+    def __init__(self, message: str, code: str = ""):
+        super().__init__(message)
+        self.code = code
+
+
+# ----------------------------------------------------------------- helpers
+
+def emit(obj: dict) -> None:
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError):
+        pass
+
+
+def log(message: str) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("%F %T ") + message.rstrip() + "\n")
+    except OSError:
+        pass
+
+
+def run(cmd: list[str], timeout: float = 10, check: bool = False, **kw) -> subprocess.CompletedProcess:
+    try:
+        cp = subprocess.run(cmd, capture_output=True, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        if check:
+            raise DockError(f"{cmd[0]} timed out")
+        return subprocess.CompletedProcess(cmd, 124, b"", b"timeout")
+    except FileNotFoundError:
+        raise DockError(f"{cmd[0]} is not installed", "missing-tool")
+    if check and cp.returncode != 0:
+        err = (cp.stderr or cp.stdout or b"").decode(errors="replace").strip().splitlines()
+        raise DockError(err[-1] if err else f"{cmd[0]} failed")
+    return cp
+
+
+def out(cmd: list[str], timeout: float = 10) -> str:
+    return run(cmd, timeout=timeout).stdout.decode(errors="replace")
+
+
+def load_config() -> dict:
+    """Source phone-mirror's bash config exactly like phone-open does."""
+    script = r'''
+PHONE_SERIAL=""; PHONE_ADDR=""; PHONE_AUDIO=0; PHONE_SCRCPY_ARGS=()
+[[ -r $1 ]] && . "$1" >/dev/null 2>&1
+printf '%s\0' "$PHONE_SERIAL" "$PHONE_ADDR" "$PHONE_AUDIO" "${PHONE_SCRCPY_ARGS[@]}"
+'''
+    cfg = {"serial": "", "addr": "", "audio": False, "scrcpy_args": []}
+    try:
+        cp = subprocess.run(["bash", "-c", script, "_", CONFIG_PATH], capture_output=True, timeout=5)
+        parts = cp.stdout.decode(errors="replace").split("\0")
+        if len(parts) >= 3:
+            cfg["serial"], cfg["addr"] = parts[0].strip(), parts[1].strip()
+            cfg["audio"] = parts[2].strip() not in ("", "0")
+            cfg["scrcpy_args"] = [p for p in parts[3:] if p]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return cfg
+
+
+# --------------------------------------------------------------------- adb
+
+def adb(serial: str, *args: str, timeout: float = 10) -> subprocess.CompletedProcess:
+    return run(["adb", "-s", serial, *args], timeout=timeout)
+
+
+def is_wireless(serial: str) -> bool:
+    return ":" in serial or "_adb-tls-connect" in serial
+
+
+def ready_serial(want: str) -> str:
+    """First ready device. USB first: it is the fastest, smoothest link."""
+    wireless = ""
+    unauthorized = False
+    for line in out(["adb", "devices"]).splitlines()[1:]:
+        f = line.split()
+        if len(f) < 2 or (want and f[0] != want):
+            continue
+        if f[1] == "unauthorized":
+            unauthorized = True
+        if f[1] != "device":
+            continue
+        if not is_wireless(f[0]):
+            return f[0]
+        wireless = wireless or f[0]
+    if not wireless and unauthorized:
+        raise DockError("Unlock the phone and tap Allow on the “Allow USB debugging?” prompt", "unauthorized")
+    return wireless
+
+
+def candidates(cfg: dict) -> list[str]:
+    found = []
+    if cfg["addr"]:
+        found.append(cfg["addr"])
+    for line in out(["adb", "mdns", "services"], timeout=5).splitlines():
+        if "_adb-tls-connect" in line and line.split():
+            found.append(line.split()[-1])
+    route = out(["ip", "-4", "route", "show", "default"], timeout=3).split()
+    if "via" in route and route.index("via") + 1 < len(route):
+        found.append(route[route.index("via") + 1] + ":5555")
+    return found
+
+
+def connect(cfg: dict, explicit: str = "") -> str:
+    if not shutil.which("adb"):
+        raise DockError("adb is not installed: sudo pacman -S android-tools", "missing-tool")
+    want = explicit or cfg["serial"]
+    run(["adb", "start-server"], timeout=10)
+    serial = ready_serial(want)
+    if serial:
+        return serial
+    for _ in range(6):
+        for addr in candidates(cfg):
+            run(["adb", "connect", addr], timeout=4)
+        serial = ready_serial(want)
+        if serial:
+            return serial
+        time.sleep(1)
+    raise DockError(NOT_REACHABLE, "no-device")
+
+
+def device_info(serial: str) -> dict:
+    sh = ("wm size; echo '@@'; settings get global device_name; echo '@@'; getprop ro.product.model; "
+          "echo '@@'; dumpsys battery 2>/dev/null | grep -E '^ +(level|status|AC powered|USB powered|Wireless powered): '")
+    cp = adb(serial, "shell", sh, timeout=10)
+    if cp.returncode != 0:
+        raise DockError("Phone did not answer over ADB")
+    parts = (cp.stdout.decode(errors="replace").split("@@") + ["", "", "", ""])[:4]
+    width = height = 0
+    for m in re.finditer(r"(Physical|Override) size:\s*(\d+)x(\d+)", parts[0]):
+        width, height = int(m.group(2)), int(m.group(3))  # override (listed last) wins
+    name = parts[1].strip()
+    model = parts[2].strip()
+    if not name or name == "null":
+        name = model or "Phone"
+    battery, charging = -1, False
+    for line in parts[3].splitlines():
+        key, _, value = line.strip().partition(": ")
+        if key == "level" and value.isdigit():
+            battery = int(value)
+        elif key == "status" and value == "2":
+            charging = True
+        elif key.endswith("powered") and value == "true":
+            charging = True
+    return {"serial": serial, "link": "wifi" if is_wireless(serial) else "usb", "name": name, "model": model, "width": width, "height": height,
+            "battery": battery, "charging": charging}
+
+
+# ---------------------------------------------------------------- hyprland
+
+def hyprctl_json(what: str):
+    try:
+        return json.loads(out(["hyprctl", what, "-j"], timeout=3) or "null")
+    except ValueError:
+        return None
+
+
+def dispatch(lua: str, *legacy: str) -> None:
+    cp = run(["hyprctl", "dispatch", lua], timeout=3)
+    if cp.returncode != 0 or cp.stdout.strip() not in (b"ok", b""):
+        if legacy:
+            run(["hyprctl", "dispatch", *legacy], timeout=3)
+
+
+def find_layer(namespace: str):
+    """Global position of our layer surface and the name of its monitor."""
+    layers = hyprctl_json("layers")
+    if not isinstance(layers, dict):
+        return None
+    for monitor, data in layers.items():
+        for level in (data.get("levels") or {}).values():
+            for layer in level or []:
+                if layer.get("namespace") == namespace:
+                    return int(layer["x"]), int(layer["y"]), monitor
+    return None
+
+
+def workspace_for(monitor: str) -> str:
+    for m in hyprctl_json("monitors") or []:
+        if m.get("name") == monitor:
+            ws = m.get("activeWorkspace") or {}
+            if isinstance(ws.get("id"), int) and ws["id"] > 0:
+                return str(ws["id"])
+            if ws.get("name"):
+                return "name:" + ws["name"]
+    return ""
+
+
+def lua_str(value: str) -> str:
+    return json.dumps(value)  # a JSON string is a valid Lua string literal
+
+
+def set_rule(x: int, y: int, w: int, h: int, workspace: str) -> None:
+    ws = f"workspace = {lua_str(workspace + ' silent')}, " if workspace else ""
+    rule = (f"{RULE_VAR} = hl.window_rule({{ match = {{ title = {lua_str('^' + WINDOW_TITLE + '$')} }}, "
+            f"float = true, pin = true, {ws}size = {{ {w}, {h} }}, move = {{ {x}, {y} }}, "
+            "border_size = 0, rounding = 0, no_shadow = true, no_blur = true, no_dim = true, no_anim = true, "
+            "no_initial_focus = true, decorate = false, tag = \"-default-opacity\", opacity = \"1 1\" })")
+    clear_rule(rule)
+
+
+def clear_rule(then: str = "") -> None:
+    run(["hyprctl", "eval", f"if {RULE_VAR} then {RULE_VAR}:set_enabled(false) end; {RULE_VAR} = nil; {then}"],
+        timeout=3)
+
+
+def client_for(pid: int):
+    for c in hyprctl_json("clients") or []:
+        if c.get("pid") == pid and c.get("mapped", True):
+            return c
+    return None
+
+
+def place(client: dict, x: int, y: int, w: int, h: int) -> None:
+    win = "address:" + client["address"]
+    if not client.get("floating"):
+        dispatch(f"hl.dsp.window.float({{ window = {lua_str(win)}, action = \"toggle\" }})", "setfloating", win)
+    if not client.get("pinned"):
+        dispatch(f"hl.dsp.window.pin({{ window = {lua_str(win)} }})", "pin", win)
+    if list(client.get("size") or []) != [w, h]:
+        dispatch(f"hl.dsp.window.resize({{ window = {lua_str(win)}, x = {w}, y = {h} }})",
+                 "resizewindowpixel", f"exact {w} {h},{win}")
+    if list(client.get("at") or []) != [x, y]:
+        dispatch(f"hl.dsp.window.move({{ window = {lua_str(win)}, x = {x}, y = {y} }})",
+                 "movewindowpixel", f"exact {x} {y},{win}")
+
+
+# ------------------------------------------------------------------ mirror
+
+def kill_pid(pid: int, name: str = "scrcpy") -> None:
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            if f.read().strip() != name:
+                return
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(20):
+            time.sleep(0.1)
+            os.kill(pid, 0)
+        os.kill(pid, signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
+
+
+def stale_mirror_cleanup() -> None:
+    try:
+        with open(PID_PATH) as f:
+            kill_pid(int(f.read().strip()))
+    except (OSError, ValueError):
+        pass
+    try:
+        os.unlink(PID_PATH)
+    except OSError:
+        pass
+
+
+def tail_error(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [l.strip() for l in f.readlines()[-40:]]
+    except OSError:
+        return ""
+    errors = [l for l in lines if l.startswith("ERROR:")]
+    msg = (errors[-1] if errors else "").removeprefix("ERROR:").strip()
+    return msg
+
+
+def cmd_mirror(a) -> int:
+    def stop(*_):
+        raise SystemExit(0)
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, stop)
+
+    proc = None
+    rect = [a.x, a.y, a.w, a.h]
+    try:
+        emit({"event": "state", "state": "connecting"})
+        cfg = load_config()
+        if not shutil.which("scrcpy"):
+            raise DockError("scrcpy is not installed: sudo pacman -S scrcpy", "missing-tool")
+        serial = connect(cfg, a.serial)
+        stale_mirror_cleanup()
+
+        layer = None
+        for _ in range(30):
+            layer = find_layer(a.namespace)
+            if layer:
+                break
+            time.sleep(0.1)
+        if not layer:
+            raise DockError("Could not find the dock on screen")
+        lx, ly, monitor = layer
+
+        def target():
+            x, y, w, h = rect
+            return lx + x - BLEED, ly + y - BLEED, w + 2 * BLEED, h + 2 * BLEED
+
+        tx, ty, tw, th = target()
+        set_rule(tx, ty, tw, th, workspace_for(monitor))
+
+        emit({"event": "state", "state": "starting"})
+        adb(serial, "shell", "input keyevent KEYCODE_WAKEUP", timeout=5)
+        args = ["scrcpy", "-s", serial, *cfg["scrcpy_args"],
+                f"--window-title={WINDOW_TITLE}", "--window-borderless",
+                f"--window-width={tw}", f"--window-height={th}", "--render-fit=letterbox"]
+        if a.max_size > 0:
+            args.append(f"--max-size={a.max_size}")
+        if not cfg["audio"]:
+            args.append("--no-audio")
+        if a.screen_off:
+            args += ["--turn-screen-off", "--stay-awake"]
+
+        os.makedirs(STATE_DIR, exist_ok=True)
+        log("scrcpy " + shlex.join(args[1:]))
+        logf = open(LOG_PATH, "a", encoding="utf-8")
+        proc = subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+        logf.close()
+        with open(PID_PATH, "w") as f:
+            f.write(str(proc.pid))
+
+        started = time.monotonic()
+        mapped = False
+        last_layer_check = 0.0
+        stdin_open = True
+        while True:
+            if stdin_open:
+                ready, _, _ = select.select([sys.stdin], [], [], 0.35)
+                if ready:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break  # the dock went away
+                    words = line.split()
+                    if words[:1] == ["quit"]:
+                        break
+                    if words[:1] == ["rect"] and len(words) == 5 and all(w.lstrip("-").isdigit() for w in words[1:]):
+                        rect = [int(w) for w in words[1:]]
+                        last_layer_check = 0.0
+                    if words[:1] == ["raise"] and mapped:
+                        c = client_for(proc.pid)
+                        if c:
+                            dispatch(f"hl.dsp.window.alter_zorder({{ window = {lua_str('address:' + c['address'])}, mode = \"top\" }})",
+                                     "alterzorder", f"top,address:{c['address']}")
+            else:
+                time.sleep(0.35)
+
+            rc = proc.poll()
+            if rc is not None:
+                if not mapped:
+                    raise DockError(tail_error(LOG_PATH) or "scrcpy could not start, see " + LOG_PATH)
+                emit({"event": "state", "state": "stopped",
+                      "message": "Mirror closed" if rc == 0 else (tail_error(LOG_PATH) or "Connection lost")})
+                return 0
+
+            now = time.monotonic()
+            if now - last_layer_check > 2.0:
+                last_layer_check = now
+                found = find_layer(a.namespace)
+                if found:
+                    lx, ly, monitor = found
+            client = client_for(proc.pid)
+            if client:
+                tx, ty, tw, th = target()
+                place(client, tx, ty, tw, th)
+                if not mapped:
+                    mapped = True
+                    emit({"event": "state", "state": "running", "serial": serial})
+            elif not mapped and now - started > 25:
+                raise DockError("The mirror window never appeared, see " + LOG_PATH)
+        return 0
+    except DockError as e:
+        log("mirror: " + str(e))
+        emit({"event": "state", "state": "error", "message": str(e), "code": e.code})
+        return 1
+    finally:
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        try:
+            if proc:
+                with open(PID_PATH) as f:
+                    if f.read().strip() == str(proc.pid):
+                        os.unlink(PID_PATH)
+        except OSError:
+            pass
+        clear_rule()
+
+
+# ------------------------------------------------- scrcpy control channel
+
+def scrcpy_server_path() -> str:
+    for p in (os.environ.get("SCRCPY_SERVER_PATH", ""), "/usr/share/scrcpy/scrcpy-server",
+              "/usr/local/share/scrcpy/scrcpy-server"):
+        if p and os.path.isfile(p):
+            return p
+    raise DockError("scrcpy-server not found (is scrcpy installed?)")
+
+
+def scrcpy_version() -> str:
+    m = re.match(r"scrcpy\s+(\S+)", out(["scrcpy", "--version"], timeout=5))
+    if not m:
+        raise DockError("Could not read the scrcpy version")
+    return m.group(1)
+
+
+class Control:
+    """A control-only scrcpy server session: no video, no audio, just the
+    control socket, so the clipboard can be set or read without pasting."""
+
+    def __init__(self, serial: str):
+        self.serial = serial
+        self.sock = None
+        self.server = None
+        self.port = 0
+
+    def __enter__(self):
+        local = scrcpy_server_path()
+        version = scrcpy_version()
+        size = adb(self.serial, "shell", f"stat -c %s {DEVICE_SERVER} 2>/dev/null").stdout.strip()
+        if size != str(os.path.getsize(local)).encode():
+            cp = adb(self.serial, "push", local, DEVICE_SERVER, timeout=30)
+            if cp.returncode != 0:
+                raise DockError("Could not copy the helper to the phone")
+        scid = "%08x" % (int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF or 1)
+        cp = adb(self.serial, "forward", "tcp:0", "localabstract:scrcpy_" + scid)
+        port = cp.stdout.decode().strip()
+        if cp.returncode != 0 or not port.isdigit():
+            raise DockError("adb forward failed")
+        self.port = int(port)
+        self.server = subprocess.Popen(
+            ["adb", "-s", self.serial, "shell", f"CLASSPATH={DEVICE_SERVER}", "app_process", "/",
+             "com.genymobile.scrcpy.Server", version, f"scid={scid}", "log_level=warn",
+             "video=false", "audio=false", "control=true", "tunnel_forward=true",
+             "send_device_meta=false", "clipboard_autosync=false", "cleanup=false", "power_on=false"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if self.server.poll() is not None:
+                msg = self.server.stdout.read().decode(errors="replace").strip().splitlines()
+                raise DockError("Phone helper failed: " + (msg[-1] if msg else "exited"))
+            try:
+                s = socket.create_connection(("127.0.0.1", self.port), timeout=2)
+                if s.recv(1) == b"\x00":  # adb accepts before the server listens; the dummy byte proves it's up
+                    s.settimeout(4)
+                    self.sock = s
+                    return self
+                s.close()
+            except OSError:
+                pass
+            time.sleep(0.08)
+        raise DockError("Phone helper did not start")
+
+    def __exit__(self, *exc):
+        if self.sock:
+            self.sock.close()
+        if self.server and self.server.poll() is None:
+            try:
+                self.server.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.server.kill()
+        if self.port:
+            adb(self.serial, "forward", "--remove", f"tcp:{self.port}")
+        return False
+
+    def _recv(self, n: int) -> bytes:
+        data = b""
+        while len(data) < n:
+            chunk = self.sock.recv(n - len(data))
+            if not chunk:
+                raise DockError("Phone closed the connection")
+            data += chunk
+        return data
+
+    def _next_message(self):
+        kind = self._recv(1)[0]
+        if kind == 0:  # clipboard
+            n = struct.unpack(">I", self._recv(4))[0]
+            return kind, self._recv(n)
+        if kind == 1:  # clipboard ack
+            return kind, struct.unpack(">Q", self._recv(8))[0]
+        if kind == 2:  # uhid output, unused
+            self._recv(2)
+            n = struct.unpack(">H", self._recv(2))[0]
+            return kind, self._recv(n)
+        raise DockError("Unexpected reply from the phone")
+
+    def set_clipboard(self, text: str) -> None:
+        raw = text.encode("utf-8")[: (1 << 18) - 14]
+        raw = raw.decode("utf-8", errors="ignore").encode("utf-8")  # don't cut a character in half
+        seq = 1 + (int.from_bytes(os.urandom(4), "big"))
+        self.sock.sendall(bytes([9]) + struct.pack(">QBI", seq, 0, len(raw)) + raw)
+        try:
+            while True:
+                kind, value = self._next_message()
+                if kind == 1 and value == seq:
+                    return
+        except socket.timeout:
+            raise DockError("Phone did not confirm the clipboard")
+
+    def get_clipboard(self):
+        self.sock.sendall(bytes([8, 0]))
+        try:
+            while True:
+                kind, value = self._next_message()
+                if kind == 0:
+                    return value.decode("utf-8", errors="replace")
+        except socket.timeout:
+            return None
+
+
+# ----------------------------------------------------------------- actions
+
+def preview(text: str, n: int = 38) -> str:
+    one = " ".join(text.split())
+    return one if len(one) <= n else one[: n - 1] + "…"
+
+
+def clipboard_types() -> list[str]:
+    cp = run(["wl-paste", "--list-types"], timeout=3)
+    return cp.stdout.decode(errors="replace").split() if cp.returncode == 0 else []
+
+
+def cmd_clip_to_phone(a) -> int:
+    types = clipboard_types()
+    if not types:
+        raise DockError("Laptop clipboard is empty")
+    serial = connect(load_config(), a.serial)
+
+    if "text/uri-list" in types:
+        uris = run(["wl-paste", "-n", "-t", "text/uri-list"], timeout=3).stdout.decode(errors="replace")
+        paths = [urllib.parse.unquote(urllib.parse.urlparse(u.strip()).path)
+                 for u in uris.splitlines() if u.strip().startswith("file://")]
+        paths = [p for p in paths if os.path.exists(p)]
+        if paths:
+            return push_files(serial, paths)
+
+    text_type = next((t for t in types if t in ("text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT")), "")
+    if not text_type:
+        image = next((t for t in types if t.startswith("image/")), "")
+        if image:
+            ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}.get(image, ".png")
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, time.strftime("Clipboard %Y-%m-%d %H.%M.%S") + ext)
+                with open(path, "wb") as f:
+                    f.write(run(["wl-paste", "-t", image], timeout=10).stdout)
+                return push_files(serial, [path])
+        raise DockError("Nothing in the clipboard that the phone can take")
+
+    text = run(["wl-paste", "-n", "-t", text_type], timeout=5).stdout.decode("utf-8", errors="replace")
+    if not text:
+        raise DockError("Laptop clipboard is empty")
+    with Control(serial) as ctl:
+        ctl.set_clipboard(text)
+    emit({"ok": True, "message": f"Copied to phone: “{preview(text)}”"})
+    return 0
+
+
+def cmd_clip_from_phone(a) -> int:
+    serial = connect(load_config(), a.serial)
+    with Control(serial) as ctl:
+        text = ctl.get_clipboard()
+    if not text:
+        raise DockError("Phone clipboard is empty")
+    # wl-copy forks a daemon that keeps serving the selection; it must not inherit our pipes.
+    try:
+        cp = subprocess.run(["wl-copy"], input=text.encode("utf-8"), stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        raise DockError("wl-copy failed (is wl-clipboard installed?)")
+    if cp.returncode != 0:
+        raise DockError("wl-copy failed")
+    emit({"ok": True, "message": f"Copied from phone: “{preview(text)}”"})
+    return 0
+
+
+def unique_name(name: str, taken: set[str]) -> str:
+    if name not in taken:
+        return name
+    stem, ext = os.path.splitext(name)
+    if stem.startswith("."):
+        stem, ext = name, ""
+    i = 1
+    while f"{stem} ({i}){ext}" in taken:
+        i += 1
+    return f"{stem} ({i}){ext}"
+
+
+def push_files(serial: str, paths: list[str]) -> int:
+    paths = [os.path.abspath(p) for p in paths]
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        raise DockError("Not found: " + os.path.basename(missing[0]))
+    listing = adb(serial, "shell", f"ls -1a {PUSH_DIR} 2>/dev/null", timeout=10).stdout.decode(errors="replace")
+    taken = set(l.strip() for l in listing.splitlines())
+    sent = []
+    for i, path in enumerate(paths, 1):
+        name = unique_name(os.path.basename(path.rstrip("/")) or "file", taken)
+        taken.add(name)
+        emit({"event": "progress", "index": i, "total": len(paths), "name": name})
+        remote = f"{PUSH_DIR}/{name}"
+        cp = run(["adb", "-s", serial, "push", path, remote], timeout=3600)
+        if cp.returncode != 0:
+            err = (cp.stderr or cp.stdout).decode(errors="replace").strip().splitlines()
+            raise DockError(f"Sending {name} failed" + (": " + err[-1] if err else ""))
+        sent.append(name)
+        if os.path.isfile(path):  # let Gallery/Files see it right away
+            uri = "file://" + urllib.parse.quote(remote)
+            adb(serial, "shell", "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d " + shlex.quote(uri),
+                timeout=10)
+    what = f"“{preview(sent[0], 28)}”" if len(sent) == 1 else f"{len(sent)} files"
+    emit({"ok": True, "message": f"Sent {what} to Download", "sent": sent})
+    return 0
+
+
+def cmd_send_files(a) -> int:
+    paths = list(a.paths)
+    if not paths:
+        if not shutil.which("zenity"):
+            raise DockError("zenity is not installed (pacman -S zenity)")
+        cp = subprocess.run(["zenity", "--file-selection", "--multiple", "--separator=\n",
+                             "--title=Send to phone", f"--filename={os.path.expanduser('~')}/"],
+                            capture_output=True)
+        if cp.returncode != 0:
+            emit({"ok": False, "cancelled": True, "message": ""})
+            return 0
+        paths = [p for p in cp.stdout.decode(errors="replace").splitlines() if p]
+        if not paths:
+            emit({"ok": False, "cancelled": True, "message": ""})
+            return 0
+    serial = connect(load_config(), a.serial)
+    return push_files(serial, paths)
+
+
+def cmd_key(a) -> int:
+    serial = connect(load_config(), a.serial)
+    cp = adb(serial, "shell", "input keyevent " + KEYCODES[a.key], timeout=5)
+    if cp.returncode != 0:
+        raise DockError("Phone did not take the key")
+    emit({"ok": True, "message": ""})
+    return 0
+
+
+def pictures_dir() -> str:
+    cp = run(["xdg-user-dir", "PICTURES"], timeout=3)
+    base = cp.stdout.decode(errors="replace").strip() if cp.returncode == 0 else ""
+    if not base or base == os.path.expanduser("~"):
+        base = os.path.expanduser("~/Pictures")
+    return os.path.join(base, "Phone")
+
+
+def cmd_screenshot(a) -> int:
+    serial = connect(load_config(), a.serial)
+    cp = run(["adb", "-s", serial, "exec-out", "screencap", "-p"], timeout=20)
+    if cp.returncode != 0 or not cp.stdout.startswith(b"\x89PNG"):
+        raise DockError("The phone did not send a screenshot")
+    folder = pictures_dir()
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, time.strftime("Phone %Y-%m-%d %H.%M.%S.png"))
+    with open(path, "wb") as f:
+        f.write(cp.stdout)
+    try:
+        subprocess.run(["wl-copy", "-t", "image/png"], input=cp.stdout, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    emit({"ok": True, "message": "Screenshot copied · saved to " + path.replace(os.path.expanduser("~"), "~", 1),
+          "path": path})
+    return 0
+
+
+URL_RE = re.compile(r"^(https?://|www\.)[^\s]+$", re.I)
+
+
+def cmd_open_link(a) -> int:
+    url = (a.url or "").strip()
+    if not url:
+        cp = run(["wl-paste", "-n", "-t", "text"], timeout=3)
+        url = cp.stdout.decode("utf-8", errors="replace").strip() if cp.returncode == 0 else ""
+    if not URL_RE.match(url):
+        raise DockError("Copy a link (http… or www…) first")
+    if url.lower().startswith("www."):
+        url = "https://" + url
+    serial = connect(load_config(), a.serial)
+    adb(serial, "shell", "input keyevent KEYCODE_WAKEUP", timeout=5)
+    cp = adb(serial, "shell", "am start -a android.intent.action.VIEW -d " + shlex.quote(url), timeout=10)
+    text = (cp.stdout + cp.stderr).decode(errors="replace")
+    if cp.returncode != 0 or "Error" in text:
+        raise DockError("The phone could not open that link")
+    emit({"ok": True, "message": "Opened on phone: " + preview(url, 34)})
+    return 0
+
+
+def cmd_notifications(a) -> int:
+    serial = connect(load_config(), a.serial)
+    cp = adb(serial, "shell", "cmd statusbar expand-notifications", timeout=5)
+    if cp.returncode != 0:
+        raise DockError("Could not open the notification shade")
+    emit({"ok": True, "message": ""})
+    return 0
+
+
+def cmd_hotspot(a) -> int:
+    tool = shutil.which("phone-hotspot") or os.path.expanduser("~/.local/bin/phone-hotspot")
+    if not os.access(tool, os.X_OK):
+        raise DockError("phone-hotspot is not installed (make install in phone-mirror)")
+    cp = run([tool], timeout=120)
+    lines = (cp.stderr or b"").decode(errors="replace").strip().splitlines()
+    if cp.returncode != 0:
+        raise DockError((lines[-1] if lines else "Hotspot failed").removeprefix("phone-hotspot: "))
+    emit({"ok": True, "message": "Laptop is on the phone's hotspot"})
+    return 0
+
+
+def cmd_probe(a) -> int:
+    serial = connect(load_config(), a.serial)
+    info = device_info(serial)
+    info["ok"] = True
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, "device.json"), "w") as f:
+            json.dump({k: info[k] for k in ("name", "model", "width", "height")}, f)
+    except OSError:
+        pass
+    emit(info)
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="omaecosystem", description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn):
+        sp = sub.add_parser(name)
+        sp.add_argument("--serial", default="")
+        sp.set_defaults(fn=fn)
+        return sp
+
+    add("probe", cmd_probe)
+    m = add("mirror", cmd_mirror)
+    m.add_argument("--namespace", required=True)
+    for k in ("x", "y", "w", "h"):
+        m.add_argument("--" + k, type=int, required=True)
+    m.add_argument("--max-size", type=int, default=0)
+    m.add_argument("--screen-off", action="store_true")
+    add("clip-to-phone", cmd_clip_to_phone)
+    add("clip-from-phone", cmd_clip_from_phone)
+    f = add("send-files", cmd_send_files)
+    f.add_argument("paths", nargs="*")
+    k = add("key", cmd_key)
+    k.add_argument("key", choices=sorted(KEYCODES))
+    add("screenshot", cmd_screenshot)
+    o = add("open-link", cmd_open_link)
+    o.add_argument("url", nargs="?", default="")
+    add("notifications", cmd_notifications)
+    add("hotspot", cmd_hotspot)
+
+    a = p.parse_args()
+    if a.cmd == "mirror" and (a.w < 40 or a.h < 40):
+        p.error("mirror needs a screen rect of at least 40x40")
+    try:
+        return a.fn(a)
+    except DockError as e:
+        log(f"{a.cmd}: {e}")
+        emit({"ok": False, "message": str(e), "code": e.code})
+        return 1
+    except Exception as e:  # never leave the dock without an answer
+        log(f"{a.cmd}: unexpected {type(e).__name__}: {e}")
+        emit({"ok": False, "message": f"Unexpected error ({type(e).__name__}), see {LOG_PATH}"})
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

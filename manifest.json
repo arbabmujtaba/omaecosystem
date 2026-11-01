@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.arbabmujtaba.omaecosystem",
+  "name": "OmaEcosystem",
+  "version": "1.0.0",
+  "author": "arbabmujtaba",
+  "license": "MIT",
+  "description": "Your Android phone as part of the desktop: one click docks its live, controllable screen on the right (scrcpy over wireless ADB), with clipboard both ways, file sending, phone screenshots, link handoff, notifications and one-click hotspot.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "Dock.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaEcosystem",
+    "description": "Phone icon in the bar; click to dock your phone's screen on the right.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "aliases": ["phone", "scrcpy", "mirror", "android", "ecosystem", "phone dock"],
+    "defaults": {
+      "screenInches": 5,
+      "reserveSpace": false,
+      "phoneScreenOff": false
+    },
+    "schema": [
+      {
+        "key": "screenInches",
+        "type": "number",
+        "label": "Screen size (inches)",
+        "description": "Diagonal of the mirrored screen at real size. Shrinks automatically if it doesn't fit.",
+        "defaultValue": 5,
+        "min": 3,
+        "max": 9,
+        "step": 0.5
+      },
+      {
+        "key": "reserveSpace",
+        "type": "boolean",
+        "label": "Make room for the dock",
+        "description": "Tile windows beside the dock instead of letting it float above them.",
+        "defaultValue": false
+      },
+      {
+        "key": "phoneScreenOff",
+        "type": "boolean",
+        "label": "Turn the phone's own screen off",
+        "description": "The phone keeps running but its display stays dark while docked.",
+        "defaultValue": false
+      }
+    ]
+  }
+}
