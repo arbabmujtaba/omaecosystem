@@ -139,7 +139,7 @@ Item {
     var cmd = [cli, "mirror", "--namespace", layerNamespace,
       "--x", String(r.x), "--y", String(r.y), "--w", String(r.w), "--h", String(r.h),
       "--max-size", String(Math.round(holeH * dpr))]
-    if (device.serial) cmd.push("--serial", device.serial)
+    if (device.serial) cmd.push("--serial=" + device.serial)
     if (phoneScreenOff) cmd.push("--screen-off")
     mirrorProc.command = cmd
     mirrorProc.running = true
@@ -273,10 +273,11 @@ Item {
     toast("", true)
     var cmd = [cli].concat(args)
     if (name === "hotspot") {
-      if (hotspotBluetooth) cmd.push("--bt-mac", hotspotBluetooth)
-      if (hotspotWifi) cmd.push("--wifi", hotspotWifi)
+      // "--opt=value" so a value starting with "-" can't be read as an option
+      if (hotspotBluetooth) cmd.push("--bt-mac=" + hotspotBluetooth)
+      if (hotspotWifi) cmd.push("--wifi=" + hotspotWifi)
     }
-    if (device.serial) cmd.push("--serial", device.serial)
+    if (device.serial) cmd.push("--serial=" + device.serial)
     actionProc.command = cmd
     actionProc.lastResult = null
     actionProc.running = true
@@ -288,7 +289,7 @@ Item {
   function runQuick(args) {
     if (keyProc.running) return
     var cmd = [cli].concat(args)
-    if (device.serial) cmd.push("--serial", device.serial)
+    if (device.serial) cmd.push("--serial=" + device.serial)
     keyProc.command = cmd
     keyProc.running = true
   }

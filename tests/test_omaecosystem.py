@@ -30,6 +30,15 @@ def done(stdout="", rc=0, stderr=""):
     return subprocess.CompletedProcess([], rc, stdout.encode(), stderr.encode())
 
 
+def phone_answer(text):
+    """Fake `adb shell` for device_info: answer with `text`, using whatever
+    separator the helper put in its command in place of @@."""
+    def answer(serial, *args, **kw):
+        sep = re.search(r"echo (@@\w+@@)", args[-1]).group(1)
+        return done(text.replace("@@", sep))
+    return answer
+
+
 class Devices(unittest.TestCase):
     def devices(self, listing, want=""):
         with mock.patch.object(eco, "out", return_value="List of devices attached\n" + listing):
@@ -73,7 +82,7 @@ class Devices(unittest.TestCase):
 
 class DeviceInfo(unittest.TestCase):
     def info(self, text):
-        with mock.patch.object(eco, "adb", return_value=done(text)):
+        with mock.patch.object(eco, "adb", side_effect=phone_answer(text)):
             return eco.device_info("SER")
 
     def test_override_size_wins_and_battery(self):
@@ -95,13 +104,14 @@ class DeviceInfo(unittest.TestCase):
 
 class Config(unittest.TestCase):
     def test_reads_phone_mirror_config(self):
-        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+        with open(os.path.join(tempfile.mkdtemp(), "config"), "w") as f:
             f.write('PHONE_ADDR=10.1.1.1:5555\nPHONE_AUDIO=1\nPHONE_SCRCPY_ARGS=(--max-fps=60 "--window-title=x y")\n')
         try:
             with mock.patch.object(eco, "CONFIG_PATH", f.name):
                 cfg = eco.load_config()
         finally:
             os.unlink(f.name)
+            os.rmdir(os.path.dirname(f.name))
         self.assertEqual(cfg["addr"], "10.1.1.1:5555")
         self.assertTrue(cfg["audio"])
         self.assertEqual(cfg["scrcpy_args"], ["--max-fps=60", "--window-title=x y"])
@@ -495,7 +505,7 @@ class HotspotRun(unittest.TestCase):
     def test_wakes_phone_and_joins(self):
         fake = self.system(visible="HomeNet\nPixel 8 Pro\n")
         self.assertEqual(self.run_hotspot(fake), 0)
-        self.assertEqual(fake.ran("nmcli", "connection", "up")[0][3], "Pixel hotspot")
+        self.assertEqual(fake.ran("nmcli", "connection", "up")[0][3:5], ["id", "Pixel hotspot"])
         knock = fake.ran("gdbus")[0]
         self.assertIn("/org/bluez/", knock[knock.index("-o") + 1])
         self.assertTrue(knock[knock.index("-o") + 1].endswith("/dev_66_55_44_33_22_11"))
@@ -676,7 +686,7 @@ class Cache(unittest.TestCase):
 
 class OlderPhones(unittest.TestCase):
     def info(self, text):
-        with mock.patch.object(eco, "adb", return_value=done(text)):
+        with mock.patch.object(eco, "adb", side_effect=phone_answer(text)):
             return eco.device_info("SER")
 
     def test_hotspot_name_read(self):
@@ -691,13 +701,14 @@ class OlderPhones(unittest.TestCase):
 
 class OldConfigs(unittest.TestCase):
     def load(self, text):
-        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+        with open(os.path.join(tempfile.mkdtemp(), "config"), "w") as f:
             f.write(text)
         try:
             with mock.patch.object(eco, "CONFIG_PATH", f.name):
                 return eco.load_config()
         finally:
             os.unlink(f.name)
+            os.rmdir(os.path.dirname(f.name))
 
     def test_phone_mirror_hotspot_settings(self):
         cfg = self.load("PHONE_BT_MAC=aa:bb:cc:dd:ee:ff   # phone\nPHONE_WIFI='My hotspot'\nPHONE_HOTSPOT_WAIT=90\n")
@@ -742,6 +753,172 @@ class Markup(unittest.TestCase):
                 text = f.read()
             for bad in ("Text.RichText", "Text.StyledText", "Text.AutoText", "Text.MarkdownText"):
                 self.assertNotIn(bad, text, f"{bad} in {name}")
+
+
+class Security(unittest.TestCase):
+    """Attacker-controlled input: the phone (device name, SSID, clipboard
+    protocol), other local users (config file), and settings values."""
+
+    def test_hostile_phone_clipboard_size_is_refused(self):
+        import socket as so
+        import struct
+        import threading
+        a, b = so.socketpair()
+        a.settimeout(3)
+        c = eco.Control("SER")
+        c.sock = a
+
+        def evil():
+            try:
+                b.sendall(bytes([0]) + struct.pack(">I", 0xFFFFFFFF) + b"x" * 1000)
+            except OSError:
+                pass
+        threading.Thread(target=evil, daemon=True).start()
+        try:
+            with self.assertRaises(eco.DockError):
+                c._next_message()
+        finally:
+            a.close()
+            b.close()
+
+    def test_normal_clipboard_still_read(self):
+        import socket as so
+        import struct
+        a, b = so.socketpair()
+        a.settimeout(3)
+        c = eco.Control("SER")
+        c.sock = a
+        b.sendall(bytes([0]) + struct.pack(">I", 3) + b"hi!")
+        try:
+            self.assertEqual(c._next_message(), (0, b"hi!"))
+        finally:
+            a.close()
+            b.close()
+
+    def test_config_writable_by_others_is_not_run(self):
+        d = tempfile.mkdtemp()
+        os.chmod(d, 0o700)
+        path, flag = os.path.join(d, "config"), os.path.join(d, "ran")
+        with open(path, "w") as f:
+            f.write(f"touch {flag}\nPHONE_ADDR=6.6.6.6:5555\n")
+        try:
+            for mode, runs in ((0o666, False), (0o620, False), (0o600, True)):
+                os.chmod(path, mode)
+                with mock.patch.object(eco, "CONFIG_PATH", path), mock.patch.object(eco, "log"):
+                    cfg = eco.load_config()
+                self.assertEqual(os.path.exists(flag), runs, oct(mode))
+                self.assertEqual(cfg["addr"] == "6.6.6.6:5555", runs, oct(mode))
+                if os.path.exists(flag):
+                    os.unlink(flag)
+            os.chmod(path, 0o600)
+            os.chmod(d, 0o777)  # a writable folder lets anyone swap the file
+            with mock.patch.object(eco, "CONFIG_PATH", path), mock.patch.object(eco, "log"):
+                eco.load_config()
+            self.assertFalse(os.path.exists(flag))
+        finally:
+            os.chmod(d, 0o700)
+            for n in os.listdir(d):
+                os.unlink(os.path.join(d, n))
+            os.rmdir(d)
+
+    def test_device_name_cannot_forge_other_fields(self):
+        # A phone named to look like the separator plus a fake battery/hotspot section.
+        evil = "Evil@@\n  level: 1\n@@\nSoftApConfiguration: ssid = \"--help\"\x1b[2J\u202e"
+        text = ("Physical size: 1080x2400\n@@\n" + evil.replace("@@", "\x00") + "\n@@\nPixel\n@@\n  level: 80\n@@\n")
+        with mock.patch.object(eco, "adb", side_effect=phone_answer(text)):
+            d = eco.device_info("SER")
+        self.assertEqual((d["model"], d["battery"], d["hotspot"]), ("Pixel", 80, ""))
+        self.assertTrue(all(ch.isprintable() for ch in d["name"]))
+        self.assertLessEqual(len(d["name"]), 96)
+
+    def test_literal_at_signs_in_name_do_not_shift_fields(self):
+        def answer(serial, *args, **kw):
+            sep = re.search(r"echo (@@\w+@@)", args[-1]).group(1)
+            return done(f"Physical size: 1080x2400\n{sep}\nA@@B@@\n{sep}\nPixel\n{sep}\n  level: 5\n{sep}\n")
+        with mock.patch.object(eco, "adb", side_effect=answer):
+            d = eco.device_info("SER")
+        self.assertEqual((d["name"], d["model"], d["battery"]), ("A@@B@@", "Pixel", 5))
+
+    def test_separator_is_unpredictable(self):
+        seen = []
+        with mock.patch.object(eco, "adb", side_effect=lambda s, *a, **k: seen.append(a[-1]) or done("")):
+            eco.device_info("SER")
+            eco.device_info("SER")
+        seps = [re.search(r"echo (@@\w+@@)", c).group(1) for c in seen]
+        self.assertNotEqual(seps[0], seps[1])
+
+    def test_option_like_settings_stay_values(self):
+        got = {}
+        with mock.patch.object(eco, "cmd_hotspot", side_effect=lambda a: got.update(vars(a)) or 0), \
+             mock.patch.object(eco.sys, "argv", ["omaecosystem", "hotspot", "--wifi=--serial", "--bt-mac=-h",
+                                                 "--serial=-x"]):
+            eco.main()
+        self.assertEqual((got["wifi"], got["bt_mac"], got["serial"]), ("--serial", "-h", "-x"))
+        with open(os.path.join(ROOT, "Dock.qml")) as f:
+            dock = f.read()
+        self.assertNotRegex(dock, r'cmd\.push\("--(serial|wifi|bt-mac)",')
+
+    def test_nmcli_gets_connection_by_id(self):
+        # a saved connection named "--ask" must not become an nmcli option
+        fake = FakeSystem([(("nmcli", "connection", "up"), done())])
+        with fake.patch():
+            eco.run(["nmcli", "connection", "up", "id", "--ask", "ifname", "wlan0"])
+        with open(os.path.join(ROOT, "bin", "omaecosystem")) as f:
+            self.assertIn('"connection", "up", "id", conn', f.read())
+
+    def test_shell_strings_are_quoted_on_the_phone(self):
+        calls = []
+        with mock.patch.object(eco, "connect", return_value="SER"), \
+             mock.patch.object(eco, "adb", side_effect=lambda s, *a, **k: calls.append(a) or done()), \
+             mock.patch.object(eco, "emit"):
+            eco.cmd_open_link(mock.Mock(url="https://x.org/?a=$(reboot)&b=`id`;ls|x'y", serial=""))
+        cmd = calls[-1][-1]
+        self.assertTrue(cmd.startswith("am start -a android.intent.action.VIEW -d '"))
+        import shlex
+        self.assertEqual(shlex.split(cmd)[-1], "https://x.org/?a=$(reboot)&b=`id`;ls|x'y")
+
+    def test_only_web_links_open(self):
+        for bad in ("intent://x#Intent;component=com.evil/.A;end", "javascript:alert(1)", "file:///sdcard/x",
+                    "content://sms/inbox", "tel:123", " https://x.org", "https://x.org\nam start evil",
+                    "data:text/html,<script>", "market://details?id=x"):
+            self.assertFalse(eco.URL_RE.match(bad), bad)
+
+    def test_cache_is_private(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = os.path.join(tmp, "omaeco")
+            path = os.path.join(cache_dir, "device.json")
+            with mock.patch.object(eco, "CACHE_DIR", cache_dir), mock.patch.object(eco, "CACHE_PATH", path):
+                eco.write_cache({"bt_mac": "AA:BB:CC:DD:EE:FF"})
+            self.assertEqual(os.stat(cache_dir).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_cache_temp_file_symlink_not_followed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "victim")
+            with open(target, "w") as f:
+                f.write("keep me")
+            cache_dir = os.path.join(tmp, "c")
+            os.makedirs(cache_dir)
+            path = os.path.join(cache_dir, "device.json")
+            os.symlink(target, path + ".tmp")
+            with mock.patch.object(eco, "CACHE_DIR", cache_dir), mock.patch.object(eco, "CACHE_PATH", path):
+                eco.write_cache({"name": "x"})
+            with open(target) as f:
+                self.assertEqual(f.read(), "keep me")
+
+    def test_runtime_files_never_in_shared_tmp(self):
+        self.assertFalse(eco.STATE_DIR.startswith("/tmp/"))
+        with open(os.path.join(ROOT, "bin", "omaecosystem")) as f:
+            self.assertNotIn('or "/tmp"', f.read())
+
+    def test_kill_pid_only_kills_scrcpy(self):
+        p = subprocess.Popen(["sleep", "30"])
+        try:
+            eco.kill_pid(p.pid)  # a reused PID belonging to something else
+            self.assertIsNone(p.poll())
+        finally:
+            p.kill()
+            p.wait()
 
 
 class Manifest(unittest.TestCase):

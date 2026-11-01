@@ -51,6 +51,13 @@ up the wireless link.
 A stock phone forgets wireless ADB when it reboots. After a phone restart,
 plug it in once and it switches back over automatically.
 
+**What "Keep wireless mirroring ready" opens up:** wireless ADB listens on
+port 5555 on the phone, on whatever Wi-Fi the phone is on, until it reboots.
+Any device on that network can try to connect. The phone still asks before
+it accepts a computer it doesn't know, so never tap Allow on a prompt you
+didn't expect. On public Wi-Fi, turn the setting off
+(`keepWireless false`, below) and use the cable.
+
 ## Hotspot
 
 The **Hotspot** tile turns on the phone's hotspot and joins it, even when the
