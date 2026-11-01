@@ -64,6 +64,7 @@ class Devices(unittest.TestCase):
              mock.patch.object(eco, "run", return_value=done()), \
              mock.patch.object(eco, "ready_serial", return_value=""), \
              mock.patch.object(eco, "candidates", return_value=[]), \
+             mock.patch.object(eco.time, "monotonic", side_effect=iter(range(0, 1000, 3)).__next__), \
              mock.patch.object(eco.time, "sleep"):
             with self.assertRaises(eco.DockError) as cm:
                 eco.connect({"serial": "", "addr": ""})
@@ -110,6 +111,74 @@ class Config(unittest.TestCase):
             cfg = eco.load_config()
         self.assertEqual(cfg, {"serial": "", "addr": "", "audio": False, "bt_mac": "", "wifi": "",
                                "hotspot_wait": 40, "scrcpy_args": []})
+
+
+class LuaStrings(unittest.TestCase):
+    """Workspace names go into Hyprland Lua. Lua has no JSON-style \\uXXXX escape
+    ("missing '{'"), so non-ASCII names used to break the window rule."""
+
+    def unlua(self, lit):
+        self.assertTrue(lit.startswith('"') and lit.endswith('"'))
+        body, raw, i = lit[1:-1], bytearray(), 0
+        while i < len(body):
+            if body[i] == "\\":
+                self.assertRegex(body[i + 1:i + 4], r"^\d{3}$")
+                raw.append(int(body[i + 1:i + 4]))
+                i += 4
+            else:
+                self.assertNotIn(body[i], '"\n\r')
+                raw += body[i].encode("ascii")
+                i += 1
+        return raw.decode("utf-8")
+
+    def test_round_trip_and_no_unicode_escapes(self):
+        for name in ["3", "chat", "🎵 music", "Café", "日本", 'a"b\\c', "tab\there", "x\nos.exit()", "]]--", ""]:
+            lit = eco.lua_str(name)
+            self.assertNotIn("\\u", lit)
+            self.assertEqual(self.unlua(lit), name)
+
+    def test_rule_with_emoji_workspace(self):
+        seen = []
+        with mock.patch.object(eco, "run", side_effect=lambda cmd, **kw: seen.append(cmd) or done("ok")):
+            eco.set_rule(1, 2, 3, 4, "name:🎵")
+        self.assertNotIn("\\u", seen[0][2])
+        self.assertIn(eco.lua_str("name:🎵 silent"), seen[0][2])
+
+
+class Discovery(unittest.TestCase):
+    def cands(self, mdns, route="default via 192.168.43.1 dev wlan0 proto dhcp metric 600\n", addr=""):
+        fake = FakeSystem([(("adb", "mdns", "services"), done(mdns)), (("ip", "-4", "route"), done(route))])
+        with fake.patch():
+            return eco.candidates({"addr": addr, "serial": ""})
+
+    def test_old_adb_mdns_format(self):
+        self.assertEqual(self.cands("List of discovered mdns services\n"
+                                    "adb-R5CW-abc\t_adb-tls-connect._tcp\t192.168.43.1:37211\n"),
+                         ["192.168.43.1:37211", "192.168.43.1:5555"])
+
+    def test_new_adb_mdns_format_without_port(self):
+        # android-tools 37 prints no port; must not produce a bogus candidate
+        self.assertEqual(self.cands("List of discovered mdns services\n\n"
+                                    "- Galaxy S23 Ultra: fcac5e on 10.151.159.28 via LAN (paired and reachable)\n"),
+                         ["192.168.43.1:5555"])
+
+    def test_no_default_route_and_dedupe(self):
+        self.assertEqual(self.cands("", route="", addr="10.0.0.2:5555"), ["10.0.0.2:5555"])
+        self.assertEqual(self.cands("", route="default via 10.0.0.2 dev wlan0\n", addr="10.0.0.2:5555"),
+                         ["10.0.0.2:5555"])
+
+    def test_stale_address_does_not_block_others(self):
+        def fake_run(cmd, timeout=10, **kw):
+            if cmd[-1] == "10.9.9.9:5555":
+                time.sleep(0.5)
+                return done(rc=124)
+            return done("connected to " + cmd[-1])
+        import time
+        with mock.patch.object(eco, "run", side_effect=fake_run):
+            t = time.monotonic()
+            got = eco.connect_all(["10.9.9.9:5555", "10.0.0.2:5555", "10.0.0.3:5555"])
+            self.assertLess(time.monotonic() - t, 0.9)
+        self.assertEqual(got, ["10.0.0.2:5555", "10.0.0.3:5555"])
 
 
 class Hyprland(unittest.TestCase):
@@ -168,6 +237,18 @@ class Files(unittest.TestCase):
         self.assertEqual(push[-1], "/sdcard/Download/it's $(rm -rf) 'x'.txt")
         scan = adb.call_args_list[-1].args[-1]
         self.assertNotIn("$(", scan.split(" -d ", 1)[1].replace("'", ""))  # URL-encoded and quoted
+
+    def test_listing_failure_never_overwrites(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "photo.jpg")
+            open(path, "w").close()
+            with mock.patch.object(eco, "adb", return_value=done(rc=1, stderr="error: closed")), \
+                 mock.patch.object(eco, "run", side_effect=lambda cmd, **kw: calls.append(cmd) or done()), \
+                 mock.patch.object(eco, "emit"):
+                with self.assertRaises(eco.DockError):
+                    eco.push_files("SER", [path])
+        self.assertFalse([c for c in calls if "push" in c])
 
     def test_link_validation(self):
         self.assertTrue(eco.URL_RE.match("https://example.com/a?b=c"))

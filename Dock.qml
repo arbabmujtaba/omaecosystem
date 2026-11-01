@@ -353,6 +353,12 @@ Item {
     }
     onExited: function(code) { if (root.keepWireless) keeperRestart.restart() }
   }
+  // The restart timers below assign `running`, which drops the binding above,
+  // so follow the setting explicitly too.
+  onKeepWirelessChanged: {
+    if (!keepWireless) keeperRestart.stop()
+    keeperProc.running = keepWireless
+  }
   Timer {
     id: keeperRestart
     interval: 30000
