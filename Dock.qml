@@ -92,6 +92,10 @@ Item {
   }
   readonly property bool reserveSpace: setting("reserveSpace", false) === true
   readonly property bool phoneScreenOff: setting("phoneScreenOff", false) === true
+  // Hotspot overrides; empty means learned from the phone (see bin/omaecosystem).
+  readonly property string hotspotBluetooth: String(setting("hotspotBluetooth", "") || "").trim()
+  readonly property string hotspotWifi: String(setting("hotspotWifi", "") || "").trim()
+  readonly property bool keepWireless: setting("keepWireless", true) !== false
 
   // ---- phone + mirror state ----------------------------------------------
 
@@ -268,6 +272,10 @@ Item {
     busyAction = name
     toast("", true)
     var cmd = [cli].concat(args)
+    if (name === "hotspot") {
+      if (hotspotBluetooth) cmd.push("--bt-mac", hotspotBluetooth)
+      if (hotspotWifi) cmd.push("--wifi", hotspotWifi)
+    }
     if (device.serial) cmd.push("--serial", device.serial)
     actionProc.command = cmd
     actionProc.lastResult = null
@@ -294,7 +302,8 @@ Item {
         try { ev = JSON.parse(line) } catch (e) { return }
         if (!ev) return
         if (ev.event === "progress") {
-          root.toastText = (ev.total > 1 ? "Sending " + ev.index + "/" + ev.total + " · " : "Sending ") + ev.name
+          root.toastText = ev.message ? ev.message
+            : (ev.total > 1 ? "Sending " + ev.index + "/" + ev.total + " · " : "Sending ") + ev.name
           root.toastOk = true
           toastTimer.stop()
         } else if (ev.ok !== undefined) {
@@ -318,6 +327,45 @@ Item {
   }
 
   Process { id: keyProc }
+
+  // ---- wireless keeper ----------------------------------------------------
+
+  // The panel is keepLoaded, so this runs for as long as the shell does, docked
+  // or not: it keeps wireless ADB up and arms it when the phone is plugged in.
+  // Closing its stdin (the shell going away) stops it.
+  property string keeperState: ""
+  Process {
+    id: keeperProc
+    command: [root.cli, "keeper"]
+    stdinEnabled: true
+    running: root.keepWireless
+    stdout: SplitParser {
+      onRead: function(line) {
+        var ev = null
+        try { ev = JSON.parse(line) } catch (e) { return }
+        if (!ev || ev.event !== "keeper") return
+        root.keeperState = ev.state
+        // Wireless just came back: if the dock is showing "no phone", try again.
+        if ((ev.state === "connected" || ev.state === "armed") && root.opened
+            && root.phase === "error" && root.phaseCode === "no-device")
+          root.connectPhone()
+      }
+    }
+    onExited: function(code) { if (root.keepWireless) keeperRestart.restart() }
+  }
+  Timer {
+    id: keeperRestart
+    interval: 30000
+    onTriggered: if (root.keepWireless && !keeperProc.running) keeperProc.running = true
+  }
+  // A shell hot reload (plugin install/update) can stop the keeper without an
+  // exit signal reaching us; check now and then that it is still up.
+  Timer {
+    interval: 60000
+    repeat: true
+    running: root.keepWireless
+    onTriggered: if (!keeperProc.running && !keeperRestart.running) keeperProc.running = true
+  }
 
   // ---- geometry -----------------------------------------------------------
 

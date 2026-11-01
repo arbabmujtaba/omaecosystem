@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "arbabmujtaba",
   "license": "MIT",
-  "description": "Your Android phone as part of the desktop: one click docks its live, controllable screen on the right (scrcpy over wireless ADB), with clipboard both ways, file sending, phone screenshots, link handoff, notifications and one-click hotspot.",
+  "description": "Your Android phone as part of the desktop: one click docks its live, controllable screen on the right (scrcpy over USB or wireless ADB), with clipboard both ways, file sending, phone screenshots, link handoff, notifications and one-click hotspot. Keeps wireless ADB ready in the background.",
   "kinds": [
     "bar-widget",
     "panel"
@@ -25,7 +25,10 @@
     "defaults": {
       "screenInches": 5,
       "reserveSpace": false,
-      "phoneScreenOff": false
+      "phoneScreenOff": false,
+      "keepWireless": true,
+      "hotspotBluetooth": "",
+      "hotspotWifi": ""
     },
     "schema": [
       {
@@ -51,6 +54,27 @@
         "label": "Turn the phone's own screen off",
         "description": "The phone keeps running but its display stays dark while docked.",
         "defaultValue": false
+      },
+      {
+        "key": "keepWireless",
+        "type": "boolean",
+        "label": "Keep wireless mirroring ready",
+        "description": "In the background, reconnect wireless ADB and switch a plugged-in phone to wireless so you can unplug it.",
+        "defaultValue": true
+      },
+      {
+        "key": "hotspotBluetooth",
+        "type": "string",
+        "label": "Phone Bluetooth address",
+        "description": "Optional. Found automatically when the phone is paired under the same name it shows over ADB.",
+        "defaultValue": ""
+      },
+      {
+        "key": "hotspotWifi",
+        "type": "string",
+        "label": "Phone hotspot name",
+        "description": "Optional. Learned from the phone when it is docked. A saved Wi-Fi connection name or the hotspot's SSID.",
+        "defaultValue": ""
       }
     ]
   }

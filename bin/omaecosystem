@@ -18,13 +18,18 @@ exactly inside the frame's screen hole, and does the one-click actions.
     omaecosystem screenshot                  phone screenshot -> ~/Pictures/Phone + laptop clipboard
     omaecosystem open-link [URL]             open a link (default: the laptop clipboard) on the phone
     omaecosystem notifications               pull down the phone's notification shade
-    omaecosystem hotspot                     turn on the phone's hotspot and join it (phone-hotspot)
+    omaecosystem hotspot [--bt-mac MAC] [--wifi NAME]
+                                          wake the phone's hotspot over Bluetooth and join it
+    omaecosystem keeper [--once]             keep wireless ADB connected (the dock runs this
+                                          in the background; stops when stdin closes)
 
 Every command takes --serial to skip device discovery. One-shot commands print a
-JSON result as their last stdout line; `mirror` prints one JSON event per line.
+JSON result as their last stdout line; `mirror` and `keeper` print one JSON event per line.
 
-Settings come from phone-mirror's config, ${XDG_CONFIG_HOME:-~/.config}/phone-mirror/config:
-PHONE_SERIAL, PHONE_ADDR, PHONE_AUDIO and PHONE_SCRCPY_ARGS work as in phone-open.
+Nothing needs configuring: the phone is found over USB, mDNS or the network, and the
+hotspot's name and Bluetooth address are learned from the phone. Optional overrides go
+in ${XDG_CONFIG_HOME:-~/.config}/phone-mirror/config (bash): PHONE_SERIAL, PHONE_ADDR,
+PHONE_AUDIO, PHONE_SCRCPY_ARGS, PHONE_BT_MAC, PHONE_WIFI and PHONE_HOTSPOT_WAIT.
 """
 
 from __future__ import annotations
@@ -112,23 +117,57 @@ def out(cmd: list[str], timeout: float = 10) -> str:
 
 
 def load_config() -> dict:
-    """Source phone-mirror's bash config exactly like phone-open does."""
+    """Optional settings, in phone-mirror's bash config format. Nothing is required:
+    without the file the phone is found automatically."""
     script = r'''
-PHONE_SERIAL=""; PHONE_ADDR=""; PHONE_AUDIO=0; PHONE_SCRCPY_ARGS=()
+PHONE_SERIAL=""; PHONE_ADDR=""; PHONE_AUDIO=0; PHONE_BT_MAC=""; PHONE_WIFI=""; PHONE_HOTSPOT_WAIT=40
+PHONE_SCRCPY_ARGS=()
 [[ -r $1 ]] && . "$1" >/dev/null 2>&1
-printf '%s\0' "$PHONE_SERIAL" "$PHONE_ADDR" "$PHONE_AUDIO" "${PHONE_SCRCPY_ARGS[@]}"
+printf '%s\0' "$PHONE_SERIAL" "$PHONE_ADDR" "$PHONE_AUDIO" "$PHONE_BT_MAC" "$PHONE_WIFI" "$PHONE_HOTSPOT_WAIT" \
+  "${PHONE_SCRCPY_ARGS[@]}"
 '''
-    cfg = {"serial": "", "addr": "", "audio": False, "scrcpy_args": []}
+    cfg = {"serial": "", "addr": "", "audio": False, "bt_mac": "", "wifi": "", "hotspot_wait": 40,
+           "scrcpy_args": []}
     try:
         cp = subprocess.run(["bash", "-c", script, "_", CONFIG_PATH], capture_output=True, timeout=5)
         parts = cp.stdout.decode(errors="replace").split("\0")
-        if len(parts) >= 3:
+        if len(parts) >= 6:
             cfg["serial"], cfg["addr"] = parts[0].strip(), parts[1].strip()
             cfg["audio"] = parts[2].strip() not in ("", "0")
-            cfg["scrcpy_args"] = [p for p in parts[3:] if p]
+            cfg["bt_mac"], cfg["wifi"] = parts[3].strip().upper(), parts[4].strip()
+            wait = parts[5].strip()
+            cfg["hotspot_wait"] = max(5, min(300, int(wait))) if wait.isdigit() else 40
+            cfg["scrcpy_args"] = [p for p in parts[6:] if p]
     except (OSError, subprocess.TimeoutExpired):
         pass
     return cfg
+
+
+CACHE_PATH = os.path.join(CACHE_DIR, "device.json")
+
+
+def read_cache() -> dict:
+    """What the plugin learned about the phone last time (name, shape, hotspot,
+    Bluetooth address), so the hotspot works when ADB can't reach the phone."""
+    try:
+        with open(CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_cache(updates: dict) -> None:
+    data = read_cache()
+    data.update({k: v for k, v in updates.items() if v not in ("", None)})
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, CACHE_PATH)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------- adb
@@ -176,7 +215,7 @@ def candidates(cfg: dict) -> list[str]:
 
 def connect(cfg: dict, explicit: str = "") -> str:
     if not shutil.which("adb"):
-        raise DockError("adb is not installed: sudo pacman -S android-tools", "missing-tool")
+        raise DockError("adb is not installed: install the android-tools package", "missing-tool")
     want = explicit or cfg["serial"]
     run(["adb", "start-server"], timeout=10)
     serial = ready_serial(want)
@@ -194,11 +233,12 @@ def connect(cfg: dict, explicit: str = "") -> str:
 
 def device_info(serial: str) -> dict:
     sh = ("wm size; echo '@@'; settings get global device_name; echo '@@'; getprop ro.product.model; "
-          "echo '@@'; dumpsys battery 2>/dev/null | grep -E '^ +(level|status|AC powered|USB powered|Wireless powered): '")
+          "echo '@@'; dumpsys battery 2>/dev/null | grep -E '^ +(level|status|AC powered|USB powered|Wireless powered): '; "
+          "echo '@@'; dumpsys wifi 2>/dev/null | grep -m1 -o 'SoftApConfiguration: ssid = \"[^\"]*\"'")
     cp = adb(serial, "shell", sh, timeout=10)
     if cp.returncode != 0:
         raise DockError("Phone did not answer over ADB")
-    parts = (cp.stdout.decode(errors="replace").split("@@") + ["", "", "", ""])[:4]
+    parts = (cp.stdout.decode(errors="replace").split("@@") + ["", "", "", "", ""])[:5]
     width = height = 0
     for m in re.finditer(r"(Physical|Override) size:\s*(\d+)x(\d+)", parts[0]):
         width, height = int(m.group(2)), int(m.group(3))  # override (listed last) wins
@@ -215,8 +255,10 @@ def device_info(serial: str) -> dict:
             charging = True
         elif key.endswith("powered") and value == "true":
             charging = True
-    return {"serial": serial, "link": "wifi" if is_wireless(serial) else "usb", "name": name, "model": model, "width": width, "height": height,
-            "battery": battery, "charging": charging}
+    m = re.search(r'ssid = "([^"]*)"', parts[4])
+    return {"serial": serial, "link": "wifi" if is_wireless(serial) else "usb", "name": name, "model": model,
+            "width": width, "height": height, "battery": battery, "charging": charging,
+            "hotspot": m.group(1) if m else ""}
 
 
 # ---------------------------------------------------------------- hyprland
@@ -349,7 +391,7 @@ def cmd_mirror(a) -> int:
         emit({"event": "state", "state": "connecting"})
         cfg = load_config()
         if not shutil.which("scrcpy"):
-            raise DockError("scrcpy is not installed: sudo pacman -S scrcpy", "missing-tool")
+            raise DockError("scrcpy is not installed: install the scrcpy package", "missing-tool")
         serial = connect(cfg, a.serial)
         stale_mirror_cleanup()
 
@@ -694,7 +736,7 @@ def cmd_send_files(a) -> int:
     paths = list(a.paths)
     if not paths:
         if not shutil.which("zenity"):
-            raise DockError("zenity is not installed (pacman -S zenity)")
+            raise DockError("zenity is not installed: install the zenity package")
         cp = subprocess.run(["zenity", "--file-selection", "--multiple", "--separator=\n",
                              "--title=Send to phone", f"--filename={os.path.expanduser('~')}/"],
                             capture_output=True)
@@ -777,28 +819,334 @@ def cmd_notifications(a) -> int:
     return 0
 
 
+# ----------------------------------------------------------------- hotspot
+#
+# No network needed. The laptop opens a tiny Bluetooth link to the phone (remote-
+# control profile only: no audio, no calls). A routine on the phone (Samsung
+# Modes and Routines: "When Bluetooth device <laptop> connects -> Mobile Hotspot
+# on") reacts to it, and the laptop joins the hotspot as soon as it appears.
+
+AVRCP_UUID = "0000110e-0000-1000-8000-00805f9b34fb"  # A/V Remote Control: no audio routing
+MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
+
+
+def split_terse(line: str) -> list[str]:
+    """Split one line of `nmcli -t` output; colons inside values come as \\:."""
+    fields, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur, esc = cur + ch, False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            fields.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    return fields + [cur]
+
+
+def paired_bluetooth() -> list[tuple[str, str]]:
+    found = []
+    for line in out(["bluetoothctl", "devices", "Paired"], timeout=5).splitlines():
+        f = line.split(" ", 2)
+        if len(f) == 3 and f[0] == "Device" and MAC_RE.match(f[1].upper()):
+            found.append((f[1].upper(), f[2].strip()))
+    return found
+
+
+def resolve_bt_mac(explicit: str, cfg: dict, cache: dict) -> str:
+    for value in (explicit, cfg.get("bt_mac", ""), cache.get("bt_mac", "")):
+        if MAC_RE.match((value or "").strip().upper()):
+            return value.strip().upper()
+    names = {str(cache.get(k, "")).strip().casefold() for k in ("name", "model")} - {""}
+    matches = [mac for mac, name in paired_bluetooth() if name.casefold() in names]
+    if len(matches) == 1:
+        return matches[0]
+    who = cache.get("name") or "the phone"
+    raise DockError(f"Pair {who} with the laptop over Bluetooth first (or set hotspotBluetooth)", "hotspot-setup")
+
+
+def wifi_device() -> str:
+    for line in out(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"], timeout=5).splitlines():
+        f = split_terse(line)
+        if len(f) >= 2 and f[1] == "wifi":
+            return f[0]
+    return ""
+
+
+def wifi_profiles() -> list[tuple[str, str]]:
+    """Saved NetworkManager Wi-Fi connections as (name, ssid)."""
+    profiles = []
+    for line in out(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"], timeout=5).splitlines():
+        f = split_terse(line)
+        if len(f) >= 2 and f[1] == "802-11-wireless":
+            ssid = out(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", f[0]], timeout=5).strip()
+            profiles.append((f[0], ssid.replace("\\:", ":")))
+    return profiles
+
+
+def resolve_wifi(explicit: str, cfg: dict, cache: dict) -> tuple[str, str]:
+    """(saved connection name or "", hotspot SSID). The setting may be either."""
+    wanted = (explicit or cfg.get("wifi", "") or cache.get("hotspot", "")).strip()
+    if not wanted:
+        raise DockError("Dock the phone once so its hotspot name is learned (or set hotspotWifi)", "hotspot-setup")
+    profiles = wifi_profiles()
+    for name, ssid in profiles:
+        if name == wanted:
+            return name, ssid or wanted
+    for name, ssid in profiles:
+        if ssid == wanted:
+            return name, ssid
+    return "", wanted
+
+
+def active_ssid(dev: str) -> str:
+    for line in out(["nmcli", "-t", "-f", "ACTIVE,SSID", "device", "wifi", "list", "ifname", dev,
+                     "--rescan", "no"], timeout=8).splitlines():
+        f = split_terse(line)
+        if len(f) >= 2 and f[0] == "yes":
+            return f[1]
+    return ""
+
+
+def visible_ssids(dev: str) -> set[str]:
+    return {split_terse(l)[0] for l in out(["nmcli", "-t", "-f", "SSID", "device", "wifi", "list", "ifname", dev,
+                                            "--rescan", "no"], timeout=8).splitlines() if l}
+
+
+def bluetooth_connected(mac: str) -> bool:
+    return bool(re.search(r"^\s*Connected:\s*yes", out(["bluetoothctl", "info", mac], timeout=5), re.M))
+
+
+def knock(mac: str) -> bool:
+    """Open the remote-control profile to the phone; that's what wakes its routine."""
+    adapters = sorted(n for n in os.listdir("/sys/class/bluetooth") if re.fullmatch(r"hci\d+", n)) \
+        if os.path.isdir("/sys/class/bluetooth") else []
+    path = f"/org/bluez/{adapters[0] if adapters else 'hci0'}/dev_{mac.replace(':', '_')}"
+    cp = run(["gdbus", "call", "--system", "-d", "org.bluez", "-o", path,
+              "-m", "org.bluez.Device1.ConnectProfile", AVRCP_UUID], timeout=20)
+    return cp.returncode == 0 or bluetooth_connected(mac)
+
+
 def cmd_hotspot(a) -> int:
-    tool = shutil.which("phone-hotspot") or os.path.expanduser("~/.local/bin/phone-hotspot")
-    if not os.access(tool, os.X_OK):
-        raise DockError("phone-hotspot is not installed (make install in phone-mirror)")
-    cp = run([tool], timeout=120)
-    lines = (cp.stderr or b"").decode(errors="replace").strip().splitlines()
-    if cp.returncode != 0:
-        raise DockError((lines[-1] if lines else "Hotspot failed").removeprefix("phone-hotspot: "))
-    emit({"ok": True, "message": "Laptop is on the phone's hotspot"})
-    return 0
+    for tool in ("nmcli", "bluetoothctl", "gdbus"):
+        if not shutil.which(tool):
+            raise DockError(f"{tool} is not installed", "missing-tool")
+    cfg, cache = load_config(), read_cache()
+    conn, ssid = resolve_wifi(a.wifi, cfg, cache)
+    dev = wifi_device()
+    if not dev:
+        raise DockError("This laptop has no Wi-Fi device")
+    if active_ssid(dev) == ssid:
+        emit({"ok": True, "message": f"Already on {ssid}"})
+        return 0
+    mac = resolve_bt_mac(a.bt_mac, cfg, cache)
+
+    run(["nmcli", "radio", "wifi", "on"], timeout=5)
+    if run(["bluetoothctl", "power", "on"], timeout=8).returncode != 0:
+        raise DockError("Bluetooth is off or missing on the laptop")
+
+    emit({"event": "progress", "message": "Waking the phone over Bluetooth…"})
+    for attempt in range(3):
+        if knock(mac):
+            break
+        if attempt < 2:
+            time.sleep(2)
+    else:
+        raise DockError("Phone not reachable over Bluetooth. Is its Bluetooth on and the phone nearby?")
+    write_cache({"bt_mac": mac, "hotspot": ssid})
+
+    emit({"event": "progress", "message": f"Phone reached. Waiting for {ssid}…"})
+    deadline = time.monotonic() + cfg.get("hotspot_wait", 40)
+    while time.monotonic() < deadline:
+        run(["nmcli", "device", "wifi", "rescan", "ifname", dev], timeout=10)
+        time.sleep(3)
+        if ssid in visible_ssids(dev):
+            if not conn:
+                raise DockError(f"{ssid} is up. Join it once from the Wi-Fi menu so the laptop remembers "
+                                "its password; after that this is one click", "hotspot-setup")
+            emit({"event": "progress", "message": f"Joining {ssid}…"})
+            if run(["nmcli", "connection", "up", conn, "ifname", dev], timeout=45).returncode == 0:
+                emit({"ok": True, "message": f"Laptop is on {ssid}"})
+                return 0
+        if active_ssid(dev) == ssid:
+            emit({"ok": True, "message": f"Laptop is on {ssid}"})
+            return 0
+    raise DockError(f"Phone was reached but {ssid} did not appear. Check the hotspot routine on the phone")
+
+
+# ------------------------------------------------------------------ keeper
+#
+# Keeps wireless ADB alive while the shell runs, so the dock connects at once:
+#   * wireless ADB connected                 -> nothing to do
+#   * phone reachable on IP:5555             -> reconnect (laptop rebooted, Wi-Fi blip)
+#   * phone plugged in by USB                -> `adb tcpip 5555` + connect
+#   * phone up but ADB gone and no USB       -> one notice: plug in USB once
+#
+# A stock phone forgets TCP-mode ADB on reboot, and Android won't run Wireless
+# debugging while the phone itself is the hotspot, so that one USB plug-in
+# after a phone reboot is the only step that can't be automated.
+
+KEEPER_INTERVAL = 5
+LOCK_PATH = os.path.join(STATE_DIR, "keeper.lock")
+
+
+def wireless_serial(want: str = "") -> str:
+    if want and not is_wireless(want):
+        want = ""  # a pinned USB serial says nothing about which wireless link to keep
+    for line in out(["adb", "devices"]).splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 2 and f[1] == "device" and is_wireless(f[0]) and (not want or f[0] == want):
+            return f[0]
+    return ""
+
+
+def usb_serial() -> str:
+    for line in out(["adb", "devices"]).splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 2 and f[1] == "device" and not is_wireless(f[0]):
+            return f[0]
+    return ""
+
+
+def try_wireless(cfg: dict) -> str:
+    for addr in candidates(cfg):
+        if b"connected to" in run(["adb", "connect", addr], timeout=4).stdout:
+            time.sleep(1)  # "connected" is also said for offline/unauthorized transports: verify
+            serial = wireless_serial(cfg["serial"])
+            if serial:
+                return serial
+            run(["adb", "disconnect", addr], timeout=4)
+    return ""
+
+
+def mirror_running() -> bool:
+    try:
+        with open(PID_PATH) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip() == "scrcpy"
+    except (OSError, ValueError):
+        return False
+
+
+def phone_seems_up(cache: dict) -> bool:
+    """The phone is around even though ADB is gone (it rebooted)."""
+    if shutil.which("kdeconnect-cli") and out(["kdeconnect-cli", "-a", "--id-only"], timeout=5).strip():
+        return True
+    dev = wifi_device() if shutil.which("nmcli") else ""
+    return bool(dev and cache.get("hotspot") and active_ssid(dev) == cache["hotspot"])
+
+
+def notify(text: str) -> None:
+    if shutil.which("notify-send"):
+        run(["notify-send", "-a", "Phone", "-i", "smartphone", "Phone", text], timeout=5)
+
+
+def keeper_step(cfg: dict, state: dict) -> str:
+    """One pass of the keeper. Returns what it saw: ready, connected, armed,
+    deferred, waiting or idle."""
+    if wireless_serial(cfg["serial"]):
+        state["warned"] = False
+        return "ready"
+    if try_wireless(cfg):
+        state["warned"] = False
+        return "connected"
+    usb = usb_serial()
+    if usb:
+        if adb(usb, "shell", "getprop service.adb.tcp.port", timeout=5).stdout.strip() != b"5555":
+            # `adb tcpip` restarts adbd, which would cut a USB mirror: wait for it to stop.
+            if mirror_running():
+                return "deferred"
+            log(f"keeper: USB phone {usb}, switching it to wireless ADB")
+            if adb(usb, "tcpip", "5555", timeout=10).returncode != 0:
+                return "idle"
+            time.sleep(3)
+        if try_wireless(cfg):
+            notify("Wireless mirroring is ready. You can unplug the cable.")
+            state["warned"] = False
+            return "armed"
+        return "idle"
+    if not state.get("warned") and phone_seems_up(read_cache()):
+        now = time.monotonic()
+        state.setdefault("since", now)
+        # Give a freshly rebooted phone / just-started hotspot a moment before nagging.
+        if now - state["since"] >= 20:
+            notify("Phone restarted: plug it in by USB once to turn wireless mirroring back on "
+                   "(it switches over by itself).")
+            state["warned"] = True
+        return "waiting"
+    state.pop("since", None)
+    return "idle"
+
+
+def other_keeper() -> str:
+    """phone-mirror's older bash keeper does the same job; don't fight it."""
+    me = os.getuid()
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != me:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if any(os.path.basename(arg) == b"phone-adb-keeper" for arg in argv[:2]):
+            return "phone-mirror's phone-adb-keeper is running and does this already"
+    return ""
+
+
+def cmd_keeper(a) -> int:
+    """Runs until stdin closes (the shell went away) or SIGTERM."""
+    import fcntl
+
+    def stop(*_):
+        raise SystemExit(0)
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, stop)
+    if not shutil.which("adb"):
+        emit({"event": "keeper", "state": "off", "message": "adb is not installed"})
+        return 0
+    os.makedirs(STATE_DIR, exist_ok=True)
+    lock = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        emit({"event": "keeper", "state": "off", "message": "another keeper is running"})
+        return 0
+
+    run(["adb", "start-server"], timeout=10)
+    cfg, state, last = load_config(), {}, ""
+    next_run = 0.0
+    while True:
+        wait = max(0.0, next_run - time.monotonic())
+        if a.once:
+            wait = 0.0
+        elif sys.stdin and not sys.stdin.closed:
+            ready, _, _ = select.select([sys.stdin], [], [], wait)
+            if ready and not sys.stdin.readline():
+                return 0  # the dock went away
+            if ready:
+                continue
+        else:
+            time.sleep(wait)
+        busy = other_keeper()
+        seen = "off" if busy else keeper_step(cfg, state)
+        if seen != last:
+            emit({"event": "keeper", "state": seen, "message": busy})
+            last = seen
+        if a.once:
+            return 0
+        next_run = time.monotonic() + (60 if busy else KEEPER_INTERVAL)
 
 
 def cmd_probe(a) -> int:
     serial = connect(load_config(), a.serial)
     info = device_info(serial)
     info["ok"] = True
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        with open(os.path.join(CACHE_DIR, "device.json"), "w") as f:
-            json.dump({k: info[k] for k in ("name", "model", "width", "height")}, f)
-    except OSError:
-        pass
+    write_cache({k: info[k] for k in ("name", "model", "width", "height", "hotspot")})
     emit(info)
     return 0
 
@@ -830,7 +1178,11 @@ def main() -> int:
     o = add("open-link", cmd_open_link)
     o.add_argument("url", nargs="?", default="")
     add("notifications", cmd_notifications)
-    add("hotspot", cmd_hotspot)
+    h = add("hotspot", cmd_hotspot)
+    h.add_argument("--bt-mac", default="")
+    h.add_argument("--wifi", default="")
+    kp = add("keeper", cmd_keeper)
+    kp.add_argument("--once", action="store_true")
 
     a = p.parse_args()
     if a.cmd == "mirror" and (a.w < 40 or a.h < 40):
