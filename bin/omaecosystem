@@ -644,14 +644,18 @@ class Control:
             raise DockError("Phone did not confirm the clipboard")
 
     def get_clipboard(self):
-        self.sock.sendall(bytes([8, 0]))
-        try:
-            while True:
-                kind, value = self._next_message()
-                if kind == 0:
-                    return value.decode("utf-8", errors="replace")
-        except socket.timeout:
-            return None
+        """The phone's clipboard text ("" when it is empty). Asks twice: right
+        after an adbd restart or unlock the first request can go unanswered."""
+        for _ in range(2):
+            self.sock.sendall(bytes([8, 0]))
+            try:
+                while True:
+                    kind, value = self._next_message()
+                    if kind == 0:
+                        return value.decode("utf-8", errors="replace")
+            except socket.timeout:
+                continue
+        raise DockError("The phone didn't send its clipboard. Unlock it and try again")
 
 
 # ----------------------------------------------------------------- actions
@@ -701,8 +705,16 @@ def cmd_clip_to_phone(a) -> int:
     return 0
 
 
+def phone_locked(serial: str) -> bool:
+    cp = adb(serial, "shell", "dumpsys window 2>/dev/null | grep -m1 -o 'isKeyguardShowing=[a-z]*'", timeout=8)
+    return b"isKeyguardShowing=true" in cp.stdout
+
+
 def cmd_clip_from_phone(a) -> int:
     serial = connect(load_config(), a.serial)
+    # Android refuses clipboard reads while the lock screen is up; say so at once.
+    if phone_locked(serial):
+        raise DockError("Unlock the phone first: Android doesn't share its clipboard while locked", "locked")
     with Control(serial) as ctl:
         text = ctl.get_clipboard()
     if not text:

@@ -181,6 +181,31 @@ class Discovery(unittest.TestCase):
         self.assertEqual(got, ["10.0.0.2:5555", "10.0.0.3:5555"])
 
 
+class PhoneClipboard(unittest.TestCase):
+    def test_locked_phone_fails_fast_with_clear_message(self):
+        with mock.patch.object(eco, "connect", return_value="SER"), \
+             mock.patch.object(eco, "adb", return_value=done("isKeyguardShowing=true")), \
+             mock.patch.object(eco, "Control") as ctl:
+            with self.assertRaises(eco.DockError) as cm:
+                eco.cmd_clip_from_phone(mock.Mock(serial=""))
+        self.assertEqual(cm.exception.code, "locked")
+        ctl.assert_not_called()
+
+    def test_unlocked_detection(self):
+        with mock.patch.object(eco, "adb", return_value=done("isKeyguardShowing=false")):
+            self.assertFalse(eco.phone_locked("SER"))
+
+    def test_get_clipboard_asks_again_then_errors(self):
+        c = eco.Control("SER")
+        c.sock = mock.Mock()
+        with mock.patch.object(c, "_next_message", side_effect=eco.socket.timeout):
+            with self.assertRaises(eco.DockError):
+                c.get_clipboard()
+        self.assertEqual(c.sock.sendall.call_count, 2)
+        with mock.patch.object(c, "_next_message", side_effect=[eco.socket.timeout, (1, 5), (0, "hi".encode())]):
+            self.assertEqual(c.get_clipboard(), "hi")
+
+
 class Hyprland(unittest.TestCase):
     def test_find_layer_on_second_monitor(self):
         layers = {"eDP-1": {"levels": {"2": [{"namespace": "omarchy-bar", "x": 0, "y": 0}]}},
