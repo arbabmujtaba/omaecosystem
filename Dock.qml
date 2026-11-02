@@ -73,8 +73,10 @@ Item {
   function findEntry(config) {
     if (!config || typeof config !== "object") return null
     var layout = config.bar && config.bar.layout ? config.bar.layout : null
-    var sections = ["left", "center", "right"]
-    for (var s = 0; layout && s < sections.length; s++) {
+    // Scan every bar section (left, centerBegin, center, centerEnd, right,
+    // tray, ...) so live `omarchy bar set` changes apply wherever the widget sits.
+    var sections = layout && typeof layout === "object" ? Object.keys(layout) : []
+    for (var s = 0; s < sections.length; s++) {
       var list = layout[sections[s]]
       for (var i = 0; Array.isArray(list) && i < list.length; i++)
         if (list[i] && list[i].id === pluginId) return list[i]
