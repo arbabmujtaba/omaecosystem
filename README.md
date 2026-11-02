@@ -3,9 +3,10 @@
 ![OmaEcosystem docked on the right of an Omarchy desktop](preview.png)
 
 Your Android phone as part of the Omarchy desktop. Click the phone icon in the
-bar and a phone-shaped dock slides in on the right showing the phone's live
-screen at a real 5-inch size. You can use it with the mouse and keyboard
-directly. One-click tiles underneath do the rest.
+bar and a phone-shaped dock slides in on the right. Press **Connect** to show
+the phone's live screen at a real 5-inch size and use it with the mouse and
+keyboard. The one-click tiles underneath work without mirroring, so you can
+just grab the clipboard or send a file.
 
 ## Features
 
@@ -83,7 +84,7 @@ doesn't work, or the name is different, set it yourself (see Settings).
 omarchy plugin add https://github.com/arbabmujtaba/omaecosystem.git --enable
 ```
 
-A phone icon appears on the right of the bar. Click it to dock the phone.
+A phone icon appears on the right of the bar. Click it to open the dock, then press **Connect** to start mirroring.
 
 From a local checkout instead: `make enable`.
 

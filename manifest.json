@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.arbabmujtaba.omaecosystem",
   "name": "OmaEcosystem",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "arbabmujtaba",
   "license": "MIT",
-  "description": "Your Android phone as part of the desktop: one click docks its live, controllable screen on the right (scrcpy over USB or wireless ADB), with clipboard both ways, file sending, phone screenshots, link handoff, notifications and one-click hotspot. Keeps wireless ADB ready in the background.",
+  "description": "Your Android phone as part of the desktop: a dock on the right with its live, controllable screen one Connect away (scrcpy over USB or wireless ADB), with clipboard both ways, file sending, phone screenshots, link handoff, notifications and one-click hotspot. Keeps wireless ADB ready in the background.",
   "kinds": [
     "bar-widget",
     "panel"

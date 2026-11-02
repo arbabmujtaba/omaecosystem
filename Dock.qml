@@ -46,7 +46,10 @@ Item {
     opened = true
     toast("", false)
     enterAnim.restart()
-    connectPhone()
+    // Only look the phone up; mirroring waits for the Connect button so the
+    // tiles (clipboard, files, ...) can be used without starting scrcpy.
+    wantMirror = false
+    checkPhone()
   }
 
   function close() {
@@ -100,8 +103,10 @@ Item {
   // ---- phone + mirror state ----------------------------------------------
 
   property var device: ({ name: "Phone", width: 1080, height: 2340, battery: -1, charging: false, serial: "" })
-  // idle | connecting | starting | running | stopped | error
+  // idle | probing | ready | connecting | starting | running | stopped | error
   property string phase: "idle"
+  // True once the user pressed Connect; until then the dock only probes.
+  property bool wantMirror: false
   property string phaseMessage: ""
   property string phaseCode: ""
   // First-time setup help instead of a bare error when no phone is set up yet.
@@ -110,6 +115,7 @@ Item {
   property bool restartWanted: false
   readonly property bool mirrorLive: opened && phase === "running"
   readonly property bool busyConnecting: phase === "connecting" || phase === "starting"
+  readonly property bool busyLooking: busyConnecting || phase === "probing"
 
   FileView {
     path: root.cachePath
@@ -123,8 +129,25 @@ Item {
     }
   }
 
+  // Find the phone (name, battery, serial) without mirroring.
+  function checkPhone() {
+    if (!opened) return
+    if (mirrorProc.running) return
+    phase = "probing"
+    phaseMessage = ""
+    phaseCode = ""
+    if (!probeProc.running) probeProc.running = true
+  }
+
+  // Retry buttons and the keeper: go back to whatever the user last asked for.
+  function retry() {
+    if (wantMirror) connectPhone()
+    else checkPhone()
+  }
+
   function connectPhone() {
     if (!opened) return
+    wantMirror = true
     phase = "connecting"
     phaseMessage = ""
     phaseCode = ""
@@ -168,8 +191,9 @@ Item {
           var keepSerial = root.device.serial
           root.device = r
           if (root.phase === "connecting") Qt.callLater(root.startMirror)
+          else if (root.phase === "probing") root.phase = "ready"
           else if (keepSerial !== r.serial && root.phase === "running") root.connectPhone()
-        } else if (root.phase === "connecting") {
+        } else if (root.phase === "connecting" || root.phase === "probing") {
           root.phase = "error"
           root.phaseMessage = r && r.message ? r.message : "Could not reach the phone"
           root.phaseCode = r && r.code ? r.code : ""
@@ -232,7 +256,7 @@ Item {
   Timer {
     interval: 60000
     repeat: true
-    running: root.mirrorLive
+    running: root.mirrorLive || (root.opened && root.phase === "ready")
     onTriggered: if (!probeProc.running) probeProc.running = true
   }
 
@@ -349,7 +373,7 @@ Item {
         // Wireless just came back: if the dock is showing "no phone", try again.
         if ((ev.state === "connected" || ev.state === "armed") && root.opened
             && root.phase === "error" && root.phaseCode === "no-device")
-          root.connectPhone()
+          root.retry()
       }
     }
     onExited: function(code) { if (root.keepWireless) keeperRestart.restart() }
@@ -589,7 +613,7 @@ Item {
           Behavior on color { ColorAnimation { duration: 300 } }
           // Blinks while mirroring (slow, like a live light), faster while connecting.
           SequentialAnimation on opacity {
-            running: root.opened && (root.mirrorLive || root.busyConnecting)
+            running: root.opened && (root.mirrorLive || root.busyLooking)
             loops: Animation.Infinite
             NumberAnimation { to: 0.2; duration: root.mirrorLive ? 700 : 380; easing.type: Easing.InOutSine }
             NumberAnimation { to: 1; duration: root.mirrorLive ? 700 : 380; easing.type: Easing.InOutSine }
@@ -642,6 +666,8 @@ Item {
             font.pixelSize: Style.font.caption
             text: {
               var s = root.mirrorLive ? (root.device.link === "usb" ? "Mirroring · USB" : "Mirroring · Wi-Fi")
+                : root.phase === "probing" ? "Looking for phone…"
+                : root.phase === "ready" ? (root.device.link === "usb" ? "Ready · USB" : "Ready · Wi-Fi")
                 : root.phase === "connecting" ? "Connecting…"
                 : root.phase === "starting" ? "Starting mirror…"
                 : root.phase === "error" ? "Not connected"
@@ -829,7 +855,7 @@ Item {
               id: guideMouse
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: root.connectPhone()
+              onClicked: root.retry()
             }
           }
         }
@@ -848,7 +874,7 @@ Item {
             transform: Translate { y: parent ? -Style.space(5) * Math.sin(phoneIcon.bob * Math.PI) : 0 }
             id: phoneIcon
             NumberAnimation on bob {
-              running: placeholder.visible && root.busyConnecting
+              running: placeholder.visible && root.busyLooking
               from: 0; to: 1; duration: 1300; loops: Animation.Infinite; easing.type: Easing.InOutSine
             }
             color: root.phase === "error" ? root.urgent : Qt.rgba(1, 1, 1, 0.85)
@@ -858,7 +884,7 @@ Item {
 
           // three-dot loader
           Row {
-            visible: root.busyConnecting || root.phase === "idle"
+            visible: root.busyLooking || root.phase === "idle"
             anchors.horizontalCenter: parent.horizontalCenter
             spacing: Style.space(7)
             Repeater {
@@ -870,7 +896,7 @@ Item {
                 color: root.accent
                 opacity: 0.25
                 SequentialAnimation on opacity {
-                  running: placeholder.visible && (root.busyConnecting || root.phase === "idle")
+                  running: placeholder.visible && (root.busyLooking || root.phase === "idle")
                   loops: Animation.Infinite
                   PauseAnimation { duration: dot.index * 160 }
                   NumberAnimation { to: 1; duration: 320 }
@@ -892,6 +918,8 @@ Item {
             font.bold: true
             text: root.phase === "error" ? "Can't reach the phone"
               : root.phase === "stopped" ? "Mirror paused"
+              : root.phase === "ready" ? "Phone ready"
+              : root.phase === "probing" ? "Looking for your phone…"
               : root.phase === "starting" ? "Opening screen…" : "Connecting…"
           }
 
@@ -906,11 +934,12 @@ Item {
             font.pixelSize: Style.font.bodySmall
             text: root.phase === "error" ? root.phaseMessage
               : root.phase === "stopped" ? (root.phaseMessage === "Mirror closed" ? "The mirror window was closed" : root.phaseMessage)
+              : root.phase === "ready" ? "Press Connect to mirror the screen. The tiles below work without it."
               : "Wireless ADB · " + (root.device.serial || "searching")
           }
 
           Rectangle {
-            visible: root.phase === "error" || root.phase === "stopped"
+            visible: root.phase === "error" || root.phase === "stopped" || root.phase === "ready"
             anchors.horizontalCenter: parent.horizontalCenter
             width: retryLabel.implicitWidth + Style.space(30)
             height: Style.space(32)
@@ -922,7 +951,8 @@ Item {
               textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
               id: retryLabel
               anchors.centerIn: parent
-              text: (root.phase === "stopped" ? "󰑐  Reconnect" : "󰑐  Try again")
+              text: root.phase === "ready" ? "󰐊  Connect"
+                : root.phase === "stopped" ? "󰑐  Reconnect" : "󰑐  Try again"
               color: root.bg
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -932,7 +962,7 @@ Item {
               id: retryMouse
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: root.connectPhone()
+              onClicked: root.phase === "ready" || root.phase === "stopped" ? root.connectPhone() : root.retry()
             }
           }
         }
