@@ -42,11 +42,11 @@ and **Moonlight** on your phone (Play Store or F-Droid).
 Turn any Android phone into a real extended Hyprland display (your mouse cursor glides off the right edge of your laptop screen onto the phone). Click `?` beside the **Phone Screen** button inside the dock to view these steps anytime:
 
 1. **Install Sunshine & Moonlight:** run `omarchy pkg add sunshine` on your laptop and install **Moonlight** on your phone.
-2. **Allow firewall ports (if `ufw` is active):**
+2. **Allow firewall ports (if `ufw` is active, run as root):**
    ```sh
    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
-     sudo ufw allow from "$net" to any port 47984,47989,48010 proto tcp
-     sudo ufw allow from "$net" to any port 47998,47999,48000,48002,48010 proto udp
+     ufw allow from "$net" to any port 47984,47989,48010 proto tcp
+     ufw allow from "$net" to any port 47998,47999,48000,48002,48010 proto udp
    done
    ```
 3. **One-time pairing:** click the **Phone Screen** button in the dock (or right-click the bar icon). Sunshine opens `https://localhost:47990` — create a local login, tap your PC in Moonlight on your phone, and enter the 4-digit PIN.
