@@ -867,7 +867,7 @@ Item {
           Repeater {
             model: root.showExtendGuide
               ? ["Install Sunshine on your laptop: omarchy pkg add sunshine",
-                 "Install Moonlight on your Android phone (Play Store or F-Droid).",
+                 "Install Moonlight on your phone (turn off 'Use touchscreen as a trackpad' for direct touch).",
                  "If ufw firewall is active, allow Sunshine ports on your LAN/hotspot.",
                  "Click Extend Screen again and pair once at https://localhost:47990."]
               : (root.phaseCode === "missing-tool"

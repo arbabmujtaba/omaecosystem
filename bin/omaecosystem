@@ -1450,6 +1450,20 @@ def apply_monitor_layout(pri_name: str, pri_mode: str, pri_pos: str, pri_scale: 
         run(["hyprctl", "keyword", "monitor", f"{v_name},{v_mode},{v_pos},{v_scale}"], timeout=4)
 
 
+def apply_touch_output(output_name: str = "") -> None:
+    """Bind virtual touchscreen/tablet devices to the phone's extended display
+    so direct taps land on the phone screen rather than across all monitors."""
+    touch_out = output_name or "Auto"
+    tablet_out = output_name or "EMPTY"
+    lua = (f"hl.config({{ input = {{ touchdevice = {{ output = {lua_str(touch_out)} }}, "
+           f"tablet = {{ output = {lua_str(tablet_out)} }} }} }})")
+    cp = run(["hyprctl", "eval", lua], timeout=4)
+    if cp.returncode == 0 and b"error" not in (cp.stdout or b"").lower():
+        return
+    run(["hyprctl", "keyword", "input:touchdevice:output", touch_out], timeout=4)
+    run(["hyprctl", "keyword", "input:tablet:output", tablet_out], timeout=4)
+
+
 def stop_sunshine_proc() -> None:
     pid = sunshine_running_pid()
     if pid:
@@ -1469,6 +1483,7 @@ def stop_sunshine_proc() -> None:
 
 def extend_stop() -> None:
     stop_sunshine_proc()
+    apply_touch_output("")
     vout = active_virtual_output()
     if not vout:
         try:
@@ -1615,6 +1630,7 @@ def extend_start(pos: str = "right", mode: str = "", scale: float | None = None,
     pri_pos, v_pos = positions.get(pos, positions["right"])
     apply_monitor_layout(pri_name, f"{pri_w}x{pri_h}@{pri_hz}", pri_pos, pri_scale,
                          vout, mode, v_pos, scale)
+    apply_touch_output(vout)
 
     conf_path = ensure_sunshine_config()
     audio_val = "enabled" if route_audio else "disabled"

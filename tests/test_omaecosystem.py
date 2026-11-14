@@ -630,6 +630,15 @@ class ExtendDisplay(unittest.TestCase):
             self.assertEqual(run_mock.call_count, 1)
             self.assertIn("Extend Screen", run_mock.call_args.args[0][-2])
 
+    def test_apply_touch_output_binds_and_restores_virtual_display(self):
+        calls = []
+        with mock.patch.object(eco, "run", side_effect=lambda cmd, **kw: calls.append(cmd) or done("ok")):
+            eco.apply_touch_output("HEADLESS-3")
+            eco.apply_touch_output("")
+        self.assertIn("HEADLESS-3", calls[0][2])
+        self.assertIn("Auto", calls[1][2])
+        self.assertIn("EMPTY", calls[1][2])
+
 
 class Keeper(unittest.TestCase):
     """The background wireless keeper on different setups."""

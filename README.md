@@ -50,7 +50,7 @@ Turn any Android phone into a real extended Hyprland display (your mouse cursor 
    done
    ```
 3. **One-time pairing:** click the **Phone Screen** button in the dock (or right-click the bar icon). Sunshine opens `https://localhost:47990` — create a local login, tap your PC in Moonlight on your phone, and enter the 4-digit PIN.
-4. **Full-screen clarity:** OmaEcosystem auto-detects your phone's native resolution and defaults to `extendScale: 2.0` so text is readable. In Moonlight's Android settings, enable **Stretch video to full screen** (or set Resolution to **Native**) to remove any side black bars.
+4. **Full-screen clarity & native touch:** OmaEcosystem auto-detects your phone's native resolution, defaults to `extendScale: 2.0`, and binds Hyprland's virtual touchscreen to the extended display. In Moonlight's Android settings, enable **Stretch video to full screen** (or set Resolution to **Native**) and turn off **Use touchscreen as a trackpad** for direct touch.
 5. **Wireless or USB & Audio:** uses USB tethering automatically when plugged in, or wakes your phone's hotspot over Bluetooth wirelessly. Audio stays on your laptop by default; click the speaker icon (`󰖁` / `󰕾`) or set `extendAudio` to route audio to the phone.
 
 ## First-time setup
