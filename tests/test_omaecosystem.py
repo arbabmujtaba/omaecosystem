@@ -300,8 +300,8 @@ def dock_fit(screen_w, screen_h, physical_mm_w, phone_ratio=2.144, inches=5.0, b
         ppmm = 96 / 25.4
     gap = 6
     pad, header, body_gap, bezel = s(14), s(30), s(10), s(8)
-    nav, tile, toast, row_gap, tile_gap = s(32), s(58), s(16), s(8), s(7)
-    chrome = pad + header + body_gap + 2 * bezel + s(2) + nav + row_gap + (2 * tile + tile_gap) + row_gap + toast + pad
+    nav, extend, tile, toast, row_gap, tile_gap = s(32), s(34), s(58), s(16), s(8), s(7)
+    chrome = pad + header + body_gap + 2 * bezel + s(2) + nav + row_gap + extend + row_gap + (2 * tile + tile_gap) + row_gap + toast + pad
     available = screen_h - bar - 2 * gap
     wanted = inches * 25.4 * phone_ratio / math.sqrt(1 + phone_ratio ** 2) * ppmm
     hole_h = math.floor(max(240, min(wanted, available - chrome)))
@@ -550,6 +550,74 @@ class HotspotRun(unittest.TestCase):
             with self.assertRaises(eco.DockError) as cm:
                 self.run_hotspot(self.system())
         self.assertEqual(cm.exception.code, "missing-tool")
+
+
+class ExtendDisplay(unittest.TestCase):
+    def test_extend_status_reports_active_and_detail(self):
+        events = []
+        with mock.patch.object(eco, "query_extend_status", return_value=(True, "HEADLESS-1", "Hotspot: 10.0.0.1")), \
+             mock.patch.object(eco, "shell_extend_audio_setting", return_value=False), \
+             mock.patch.object(eco, "emit", side_effect=events.append):
+            self.assertEqual(eco.cmd_extend_status(mock.Mock(serial="")), 0)
+        self.assertTrue(events[-1]["active"])
+        self.assertFalse(events[-1]["audio"])
+        self.assertIn("S23 Screen", events[-1]["message"])
+        self.assertNotIn("HEADLESS", events[-1]["message"])
+
+    def test_extend_display_toggles_off_and_on_with_audio_option(self):
+        events = []
+        with mock.patch.object(eco, "query_extend_status", return_value=(True, "HEADLESS-1", "")), \
+             mock.patch.object(eco, "shell_extend_audio_setting", return_value=False), \
+             mock.patch.object(eco, "extend_stop") as stop_mock, \
+             mock.patch.object(eco, "emit", side_effect=events.append):
+            args = mock.Mock(serial="", audio=None, restart=False, hotspot=False, usb=False,
+                             pos="right", mode="1920x1080@60", scale=1.25)
+            self.assertEqual(eco.cmd_extend_display(args), 0)
+        stop_mock.assert_called_once()
+        self.assertFalse(events[-1]["active"])
+        self.assertIn("S23 Screen", events[-1]["message"])
+
+        events.clear()
+        with mock.patch.object(eco, "query_extend_status", return_value=(False, "", "")), \
+             mock.patch.object(eco, "extend_start", return_value="Hotspot: 10.0.0.1") as start_mock, \
+             mock.patch.object(eco, "emit", side_effect=events.append):
+            args = mock.Mock(serial="", audio=True, restart=False, hotspot=False, usb=False,
+                             pos="right", mode="1920x1080@60", scale=1.25)
+            self.assertEqual(eco.cmd_extend_display(args), 0)
+        self.assertTrue(start_mock.call_args.kwargs["route_audio"])
+        self.assertTrue(events[-1]["active"])
+        self.assertTrue(events[-1]["audio"])
+        self.assertIn("Audio: Phone", events[-1]["message"])
+
+    def test_ensure_sunshine_config_creates_s23_screen_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(eco, "SUNSHINE_CONF_DIR", tmp):
+                conf = eco.ensure_sunshine_config()
+                with open(conf, encoding="utf-8") as f:
+                    self.assertIn("stream_audio = disabled", f.read())
+                with open(os.path.join(tmp, "apps.json"), encoding="utf-8") as f:
+                    apps = json.load(f)
+                self.assertEqual(apps["apps"][0]["name"], "S23 Screen")
+
+    def test_missing_sunshine_explains_community_setup(self):
+        with mock.patch.object(eco.shutil, "which", side_effect=lambda t: None if t == "sunshine" else "/usr/bin/" + t):
+            with self.assertRaises(eco.DockError) as cm:
+                eco.extend_start()
+        self.assertEqual(cm.exception.code, "extend-setup")
+        self.assertIn("omarchy pkg add sunshine", str(cm.exception))
+
+    def test_new_feature_notification_fires_once_when_unpaired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "device.json")
+            with mock.patch.object(eco, "CACHE_PATH", cache), \
+                 mock.patch.object(eco, "CACHE_DIR", tmp), \
+                 mock.patch.object(eco, "sunshine_has_paired_clients", return_value=False), \
+                 mock.patch.object(eco.shutil, "which", return_value="/usr/bin/notify-send"), \
+                 mock.patch.object(eco, "run", return_value=done()) as run_mock:
+                self.assertTrue(eco.maybe_notify_new_feature())
+                self.assertFalse(eco.maybe_notify_new_feature())
+            self.assertEqual(run_mock.call_count, 1)
+            self.assertIn("S23 Screen", run_mock.call_args.args[0][-2])
 
 
 class Keeper(unittest.TestCase):

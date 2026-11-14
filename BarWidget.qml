@@ -11,6 +11,10 @@ BarWidget {
   moduleName: "io.github.arbabmujtaba.omaecosystem"
 
   readonly property string pluginId: "io.github.arbabmujtaba.omaecosystem"
+  readonly property string pluginDir: {
+    var u = String(Qt.resolvedUrl("."))
+    return decodeURIComponent(u.replace(/^file:\/\//, "")).replace(/\/$/, "")
+  }
   readonly property var shellHost: bar && bar.shell ? bar.shell : null
   // openPanelIds is reassigned on every change, so this stays live.
   readonly property bool docked: shellHost && shellHost.openPanelIds
@@ -25,6 +29,10 @@ BarWidget {
     else shellHost.summon(pluginId, JSON.stringify(root.settings || {}))
   }
 
+  function toggleExtendDisplay() {
+    Quickshell.execDetached([pluginDir + "/bin/omaecosystem", "extend-display"])
+  }
+
   BarIconButton {
     id: button
     anchors.fill: parent
@@ -32,8 +40,11 @@ BarWidget {
     text: "󰄜"
     active: root.docked
     useActiveColor: false
-    tooltipText: root.docked ? "Undock phone" : "Dock phone"
-    onPressed: function(b) { root.toggleDock() }
+    tooltipText: root.docked ? "Undock phone · Right-click: S23 Screen" : "Dock phone · Right-click: S23 Screen"
+    onPressed: function(b) {
+      if (b === Qt.RightButton || b === Qt.MiddleButton) root.toggleExtendDisplay()
+      else root.toggleDock()
+    }
   }
 
   // A small accent pip under the icon while the phone is docked.

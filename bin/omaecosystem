@@ -20,6 +20,9 @@ exactly inside the frame's screen hole, and does the one-click actions.
     omaecosystem notifications               pull down the phone's notification shade
     omaecosystem hotspot [--bt-mac MAC] [--wifi NAME]
                                           wake the phone's hotspot over Bluetooth and join it
+    omaecosystem extend-display [--audio|--no-audio] [--hotspot] [--usb] [--restart]
+                                          toggle S23 Screen extended display (USB or hotspot)
+    omaecosystem extend-status            report whether S23 Screen is currently active
     omaecosystem keeper [--once]             keep wireless ADB connected (the dock runs this
                                           in the background; stops when stdin closes)
 
@@ -1189,6 +1192,7 @@ def cmd_keeper(a) -> int:
         return 0
 
     run(["adb", "start-server"], timeout=10)
+    maybe_notify_new_feature()
     cfg, state, last = load_config(), {}, ""
     next_run = 0.0
     while True:
@@ -1211,6 +1215,421 @@ def cmd_keeper(a) -> int:
         if a.once:
             return 0
         next_run = time.monotonic() + (60 if busy else KEEPER_INTERVAL)
+
+
+SUNSHINE_PID_PATH = os.path.join(STATE_DIR, "sunshine.pid")
+HEADLESS_OUT_PATH = os.path.join(STATE_DIR, "headless.out")
+PRIMARY_INFO_PATH = os.path.join(STATE_DIR, "primary.info")
+EXTEND_LOG_PATH = os.path.join(STATE_DIR, "s23-screen.log")
+SUNSHINE_CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sunshine")
+SHELL_JSON_PATH = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                               "omarchy", "shell.json")
+PLUGIN_ID = "io.github.arbabmujtaba.omaecosystem"
+FEATURE_VERSION = "1.2.0"
+
+
+def sunshine_has_paired_clients() -> bool:
+    state_path = os.path.join(SUNSHINE_CONF_DIR, "sunshine_state.json")
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            data = json.load(f)
+        devices = ((data.get("root") or {}).get("named_devices") or {})
+        return bool(devices)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def maybe_notify_new_feature(force: bool = False) -> bool:
+    cache = read_cache()
+    if not force and cache.get("featureNotifiedVersion") == FEATURE_VERSION:
+        return False
+    write_cache({"featureNotifiedVersion": FEATURE_VERSION})
+    if not force and sunshine_has_paired_clients():
+        return False
+    if shutil.which("notify-send"):
+        run(["notify-send", "-a", "OmaEcosystem", "-i", "video-display",
+             "New in OmaEcosystem: S23 Screen",
+             "Extend your desktop onto your phone wirelessly (hotspot) or via USB. "
+             "Click S23 Screen in the phone dock to set up."], timeout=5)
+    return True
+
+
+def shell_extend_audio_setting() -> bool:
+    try:
+        with open(SHELL_JSON_PATH, encoding="utf-8") as f:
+            cfg = json.load(f)
+        layout = (cfg.get("bar") or {}).get("layout") or {}
+        for section in layout.values():
+            if isinstance(section, list):
+                for item in section:
+                    if isinstance(item, dict) and item.get("id") == PLUGIN_ID and "extendAudio" in item:
+                        return bool(item["extendAudio"])
+        for item in cfg.get("plugins") or []:
+            if isinstance(item, dict) and item.get("id") == PLUGIN_ID and "extendAudio" in item:
+                return bool(item["extendAudio"])
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def ensure_sunshine_config() -> str:
+    os.makedirs(SUNSHINE_CONF_DIR, exist_ok=True)
+    conf_path = os.path.join(SUNSHINE_CONF_DIR, "sunshine.conf")
+    if not os.path.isfile(conf_path) or os.path.getsize(conf_path) == 0:
+        with open(conf_path, "w", encoding="utf-8") as f:
+            f.write("capture = wlr\nencoder = software\nsw_preset = superfast\nsw_tune = zerolatency\n"
+                    "hevc_mode = 0\norigin_web_ui_allowed = pc\nupnp = disabled\nmin_log_level = info\n"
+                    "stream_audio = disabled\n")
+    apps_path = os.path.join(SUNSHINE_CONF_DIR, "apps.json")
+    if not os.path.isfile(apps_path):
+        with open(apps_path, "w", encoding="utf-8") as f:
+            json.dump({"env": {"PATH": "$(PATH):$(HOME)/.local/bin"},
+                       "apps": [{"name": "S23 Screen", "image-path": "desktop.png"}]}, f, indent=2)
+    return conf_path
+
+
+def sunshine_running_pid() -> int:
+    try:
+        with open(SUNSHINE_PID_PATH, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+            if f.read().strip() == "sunshine":
+                return pid
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def active_virtual_output() -> str:
+    try:
+        with open(HEADLESS_OUT_PATH, encoding="utf-8") as f:
+            saved = f.read().strip()
+    except OSError:
+        return ""
+    if not saved:
+        return ""
+    for m in hyprctl_json("monitors") or []:
+        if m.get("name") == saved:
+            return saved
+    return ""
+
+
+def usb_tether_ips() -> list[tuple[str, str]]:
+    found = []
+    for line in out(["ip", "-4", "-o", "addr", "show", "up"], timeout=4).splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        ifname = parts[1]
+        ipaddr = parts[3].split("/", 1)[0]
+        try:
+            syspath = os.path.realpath(f"/sys/class/net/{ifname}")
+        except OSError:
+            syspath = ""
+        if "/usb" in syspath:
+            found.append((ifname, ipaddr))
+    return found
+
+
+def wifi_ip() -> str:
+    dev = wifi_device() if shutil.which("nmcli") else ""
+    if not dev:
+        return ""
+    for line in out(["ip", "-4", "-o", "addr", "show", "dev", dev], timeout=4).splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            return parts[3].split("/", 1)[0]
+    return ""
+
+
+def hotspot_is_active(cfg: dict, cache: dict) -> bool:
+    if not shutil.which("nmcli"):
+        return False
+    dev = wifi_device()
+    if not dev:
+        return False
+    try:
+        _, ssid = resolve_wifi("", cfg, cache)
+    except DockError:
+        return False
+    return bool(ssid and active_ssid(dev) == ssid)
+
+
+def phone_reachable_on_wifi() -> bool:
+    wip = wifi_ip()
+    if not wip or not shutil.which("adb"):
+        return False
+    prefix = wip.rsplit(".", 1)[0] + "."
+    for line in out(["adb", "devices"], timeout=4).splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 2 and f[1] == "device" and f[0].startswith(prefix):
+            return True
+    return False
+
+
+def extend_connection_summary(cfg: dict, cache: dict) -> str:
+    items = [f"USB ({ifname}): {ipaddr}" for ifname, ipaddr in usb_tether_ips()]
+    wip = wifi_ip()
+    if wip:
+        if hotspot_is_active(cfg, cache):
+            items.append(f"Hotspot: {wip}")
+        else:
+            items.append(f"Wi-Fi: {wip}")
+    return " · ".join(items) if items else "Connect USB tethering or phone hotspot, then open Moonlight"
+
+
+def query_extend_status() -> tuple[bool, str, str]:
+    pid = sunshine_running_pid()
+    vout = active_virtual_output()
+    active = bool(pid or vout)
+    cfg, cache = load_config(), read_cache()
+    detail = extend_connection_summary(cfg, cache)
+    return active, vout, detail
+
+
+def apply_monitor_layout(pri_name: str, pri_mode: str, pri_pos: str, pri_scale: float,
+                         v_name: str = "", v_mode: str = "", v_pos: str = "", v_scale: float = 1.0) -> None:
+    if v_name:
+        lua = (f"hl.monitor({{ output = {lua_str(pri_name)}, mode = {lua_str(pri_mode)}, "
+               f"position = {lua_str(pri_pos)}, scale = {pri_scale} }}); "
+               f"hl.monitor({{ output = {lua_str(v_name)}, mode = {lua_str(v_mode)}, "
+               f"position = {lua_str(v_pos)}, scale = {v_scale} }})")
+    else:
+        lua = (f"hl.monitor({{ output = {lua_str(pri_name)}, mode = {lua_str(pri_mode)}, "
+               f"position = {lua_str(pri_pos)}, scale = {pri_scale} }})")
+    cp = run(["hyprctl", "eval", lua], timeout=4)
+    if cp.returncode == 0 and b"error" not in (cp.stdout or b"").lower():
+        return
+    run(["hyprctl", "keyword", "monitor", f"{pri_name},{pri_mode},{pri_pos},{pri_scale}"], timeout=4)
+    if v_name:
+        run(["hyprctl", "keyword", "monitor", f"{v_name},{v_mode},{v_pos},{v_scale}"], timeout=4)
+
+
+def stop_sunshine_proc() -> None:
+    pid = sunshine_running_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGINT)
+            for _ in range(20):
+                time.sleep(0.1)
+                os.kill(pid, 0)
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.unlink(SUNSHINE_PID_PATH)
+    except OSError:
+        pass
+
+
+def extend_stop() -> None:
+    stop_sunshine_proc()
+    vout = active_virtual_output()
+    if not vout:
+        try:
+            with open(HEADLESS_OUT_PATH, encoding="utf-8") as f:
+                vout = f.read().strip()
+        except OSError:
+            vout = ""
+    if vout:
+        run(["hyprctl", "output", "remove", vout], timeout=4)
+    try:
+        os.unlink(HEADLESS_OUT_PATH)
+    except OSError:
+        pass
+    try:
+        with open(PRIMARY_INFO_PATH, encoding="utf-8") as f:
+            pri_name, pri_mode, pri_scale = f.read().strip().split("|", 2)
+        if re.fullmatch(r"[A-Za-z0-9._-]+", pri_name):
+            apply_monitor_layout(pri_name, pri_mode, "0x0", float(pri_scale))
+    except (OSError, ValueError):
+        pass
+    try:
+        os.unlink(PRIMARY_INFO_PATH)
+    except OSError:
+        pass
+
+
+def launch_moonlight_for_s23(serial: str) -> None:
+    if not serial or not shutil.which("adb"):
+        return
+    pkgs = adb(serial, "shell", "pm list packages com.limelight", timeout=5).stdout.decode(errors="replace")
+    if "package:com.limelight" not in pkgs:
+        return
+    adb(serial, "shell", "input keyevent KEYCODE_WAKEUP", timeout=4)
+    adb(serial, "shell", "monkey -p com.limelight -c android.intent.category.LAUNCHER 1", timeout=5)
+    # Best-effort background auto-tap into S23 Screen if Moonlight is at PcView/AppView.
+    host = socket.gethostname() or "arch"
+    script = r'''
+serial="$1"; host="$2"
+for _ in 1 2 3 4; do
+  sleep 1.2
+  xml=$(adb -s "$serial" exec-out uiautomator dump /dev/tty 2>/dev/null || true)
+  [[ $xml == *"com.limelight:id/surfaceView"* ]] && exit 0
+  xy=$(python3 - "$xml" "$host" <<'PY' 2>/dev/null || true
+import re, sys, xml.etree.ElementTree as ET
+xml_s, host = sys.argv[1], sys.argv[2]
+m = re.search(r"<\?xml.*?</hierarchy>", xml_s, re.S)
+if not m: sys.exit(0)
+root = ET.fromstring(m.group(0))
+for target in ("S23 Screen", host):
+    for node in root.iter("node"):
+        if node.attrib.get("package") == "com.limelight" and node.attrib.get("text") == target:
+            nums = [int(x) for x in re.findall(r"\d+", node.attrib.get("bounds", ""))]
+            if len(nums) == 4:
+                print((nums[0]+nums[2])//2, (nums[1]+nums[3])//2)
+                sys.exit(0)
+PY
+)
+  if [[ -n $xy ]]; then
+    adb -s "$serial" shell input tap $xy >/dev/null 2>&1 || true
+  fi
+done
+'''
+    subprocess.Popen(["bash", "-c", script, "_", serial, host],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def extend_start(pos: str = "right", mode: str = "1920x1080@60", scale: float = 1.25,
+                 route_audio: bool = False, use_hotspot: bool = False, use_usb: bool = False,
+                 explicit_serial: str = "") -> str:
+    if not shutil.which("hyprctl"):
+        raise DockError("hyprctl is required for S23 Screen", "missing-tool")
+    if not shutil.which("sunshine"):
+        raise DockError("Install sunshine (omarchy pkg add sunshine) and Moonlight on your phone to use S23 Screen",
+                        "extend-setup")
+
+    cfg, cache = load_config(), read_cache()
+    usbs = usb_tether_ips()
+
+    if use_usb and not usbs:
+        usb = usb_serial()
+        if usb:
+            adb(usb, "shell", "svc usb setFunctions rndis", timeout=6)
+            time.sleep(2)
+            usbs = usb_tether_ips()
+    elif use_hotspot or (not usbs and not hotspot_is_active(cfg, cache) and not phone_reachable_on_wifi()):
+        # No cable tethering and not yet on hotspot/phone Wi-Fi: wake hotspot wirelessly if configured.
+        try:
+            cmd_hotspot(argparse.Namespace(serial=explicit_serial, bt_mac="", wifi=""))
+        except DockError as e:
+            if use_hotspot:
+                raise
+            log(f"extend_start: hotspot auto-connect skipped ({e})")
+
+    monitors = hyprctl_json("monitors") or []
+    primary = next((m for m in monitors if not str(m.get("name", "")).startswith("HEADLESS")), None)
+    if not primary:
+        raise DockError("No primary Hyprland monitor found")
+    pri_name = str(primary["name"])
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", pri_name):
+        raise DockError(f"Unsafe monitor name: {pri_name}")
+    pri_w, pri_h = int(primary["width"]), int(primary["height"])
+    pri_hz = primary["refreshRate"]
+    pri_scale = float(primary["scale"])
+    pri_lw = round(pri_w / pri_scale)
+    pri_lh = round(pri_h / pri_scale)
+
+    h_res = mode.split("@", 1)[0]
+    hw_s, hh_s = h_res.split("x", 1)
+    h_lw = round(int(hw_s) / scale)
+    h_lh = round(int(hh_s) / scale)
+
+    before = {str(m.get("name", "")) for m in monitors if str(m.get("name", "")).startswith("HEADLESS")}
+    run(["hyprctl", "output", "create", "headless"], timeout=5, check=True)
+    vout = ""
+    for _ in range(20):
+        cur = [str(m.get("name", "")) for m in (hyprctl_json("monitors") or [])
+               if str(m.get("name", "")).startswith("HEADLESS") and str(m.get("name", "")) not in before]
+        if cur:
+            vout = cur[0]
+            break
+        time.sleep(0.1)
+    if not re.fullmatch(r"HEADLESS-\d+", vout):
+        raise DockError("Could not create virtual S23 Screen output")
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(HEADLESS_OUT_PATH, "w", encoding="utf-8") as f:
+        f.write(vout + "\n")
+    with open(PRIMARY_INFO_PATH, "w", encoding="utf-8") as f:
+        f.write(f"{pri_name}|{pri_w}x{pri_h}@{pri_hz}|{pri_scale}\n")
+
+    positions = {
+        "right": ("0x0", f"{pri_lw}x0"),
+        "left": (f"{h_lw}x0", "0x0"),
+        "above": (f"0x{h_lh}", "0x0"),
+        "below": ("0x0", f"0x{pri_lh}"),
+    }
+    pri_pos, v_pos = positions.get(pos, positions["right"])
+    apply_monitor_layout(pri_name, f"{pri_w}x{pri_h}@{pri_hz}", pri_pos, pri_scale,
+                         vout, mode, v_pos, scale)
+
+    conf_path = ensure_sunshine_config()
+    audio_val = "enabled" if route_audio else "disabled"
+    logf = open(EXTEND_LOG_PATH, "a", encoding="utf-8")
+    logf.write(f"--- {time.strftime('%F %T')} S23 Screen ({vout} {mode} scale={scale} pos={pos} audio={audio_val}) ---\n")
+    logf.flush()
+    proc = subprocess.Popen(
+        ["sunshine", conf_path, f"output_name={vout}", f"stream_audio={audio_val}"],
+        stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+    logf.close()
+    with open(SUNSHINE_PID_PATH, "w", encoding="utf-8") as f:
+        f.write(str(proc.pid))
+
+    listening = False
+    for _ in range(30):
+        if proc.poll() is not None:
+            extend_stop()
+            raise DockError("Sunshine exited unexpectedly, see " + EXTEND_LOG_PATH)
+        if b":47989" in run(["ss", "-Hltn", "sport = :47989"], timeout=3).stdout:
+            listening = True
+            break
+        time.sleep(0.2)
+    if not listening:
+        extend_stop()
+        raise DockError("Sunshine did not start listening on port 47989")
+
+    serial = explicit_serial or ready_serial(cfg.get("serial", ""))
+    launch_moonlight_for_s23(serial)
+    paired = sunshine_has_paired_clients()
+    if not paired:
+        if shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", "https://localhost:47990"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        notify("S23 Screen ready for first-time pairing: install Moonlight on your phone and pair at https://localhost:47990")
+    return extend_connection_summary(cfg, read_cache())
+
+
+def cmd_extend_status(a) -> int:
+    active, _, detail = query_extend_status()
+    audio = shell_extend_audio_setting()
+    paired = sunshine_has_paired_clients()
+    msg = f"S23 Screen active · {detail}" if active and detail else ("S23 Screen active" if active else "S23 Screen off")
+    emit({"ok": True, "active": active, "audio": audio, "paired": paired, "detail": detail, "message": msg})
+    return 0
+
+
+def cmd_extend_display(a) -> int:
+    active, _, _ = query_extend_status()
+    route_audio = shell_extend_audio_setting() if a.audio is None else a.audio
+    if active and not getattr(a, "restart", False):
+        emit({"event": "progress", "message": "Stopping S23 Screen…"})
+        extend_stop()
+        emit({"ok": True, "active": False, "audio": route_audio, "detail": "", "message": "S23 Screen turned off"})
+        return 0
+    if active and getattr(a, "restart", False):
+        emit({"event": "progress", "message": "Updating S23 Screen audio…"})
+        extend_stop()
+    else:
+        emit({"event": "progress", "message": "Starting S23 Screen…"})
+    detail = extend_start(pos=a.pos, mode=a.mode, scale=a.scale, route_audio=route_audio,
+                          use_hotspot=a.hotspot, use_usb=a.usb, explicit_serial=a.serial)
+    audio_note = "Audio: Phone" if route_audio else "Audio: Laptop"
+    emit({"ok": True, "active": True, "audio": route_audio, "detail": detail,
+          "message": f"S23 Screen live · {audio_note} · {detail}"})
+    return 0
 
 
 def cmd_probe(a) -> int:
@@ -1252,6 +1671,16 @@ def main() -> int:
     h = add("hotspot", cmd_hotspot)
     h.add_argument("--bt-mac", default="")
     h.add_argument("--wifi", default="")
+    ed = add("extend-display", cmd_extend_display)
+    ed.add_argument("--audio", dest="audio", action="store_true", default=None)
+    ed.add_argument("--no-audio", dest="audio", action="store_false")
+    ed.add_argument("--hotspot", action="store_true")
+    ed.add_argument("--usb", action="store_true")
+    ed.add_argument("--restart", action="store_true")
+    ed.add_argument("--pos", default="right", choices=("right", "left", "above", "below"))
+    ed.add_argument("--mode", default="1920x1080@60")
+    ed.add_argument("--scale", type=float, default=1.25)
+    add("extend-status", cmd_extend_status)
     kp = add("keeper", cmd_keeper)
     kp.add_argument("--once", action="store_true")
 

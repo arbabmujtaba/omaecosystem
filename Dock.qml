@@ -50,6 +50,7 @@ Item {
     // tiles (clipboard, files, ...) can be used without starting scrcpy.
     wantMirror = false
     checkPhone()
+    refreshExtendStatus()
   }
 
   function close() {
@@ -101,6 +102,9 @@ Item {
   readonly property string hotspotBluetooth: String(setting("hotspotBluetooth", "") || "").trim()
   readonly property string hotspotWifi: String(setting("hotspotWifi", "") || "").trim()
   readonly property bool keepWireless: setting("keepWireless", true) !== false
+  readonly property bool extendAudioSetting: setting("extendAudio", false) === true
+  onExtendAudioSettingChanged: extendAudio = extendAudioSetting
+  Component.onCompleted: extendAudio = extendAudioSetting
 
   // ---- phone + mirror state ----------------------------------------------
 
@@ -280,6 +284,52 @@ Item {
   property int flashSeq: 0
   property string toastText: ""
   property bool toastOk: true
+  property bool extendLive: false
+  property bool extendAudio: false
+  property bool extendPaired: true
+
+  function refreshExtendStatus() {
+    if (!extendStatusProc.running) extendStatusProc.running = true
+  }
+
+  function toggleExtendDisplay(restart) {
+    var args = ["extend-display", extendAudio ? "--audio" : "--no-audio"]
+    if (restart) args.push("--restart")
+    runAction("extend", args)
+  }
+
+  function toggleExtendAudio() {
+    if (busyAction !== "") return
+    extendAudio = !extendAudio
+    if (extendLive) {
+      toggleExtendDisplay(true)
+    } else {
+      toast(extendAudio ? "S23 Screen audio: Phone" : "S23 Screen audio: Laptop", true)
+    }
+  }
+
+  Process {
+    id: extendStatusProc
+    command: [root.cli, "extend-status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var r = null
+        try { r = JSON.parse(String(text).trim().split("\n").pop()) } catch (e) {}
+        if (r && r.ok !== undefined) {
+          root.extendLive = r.active === true
+          if (r.paired !== undefined) root.extendPaired = r.paired === true
+        }
+      }
+    }
+  }
+
+  Timer {
+    interval: 5000
+    repeat: true
+    running: root.opened
+    onTriggered: root.refreshExtendStatus()
+  }
 
   function toast(text, ok) {
     toastText = text
@@ -346,6 +396,10 @@ Item {
         root.flashKey = key
         root.flashOk = !!(r && r.ok)
         root.flashSeq++
+      }
+      if (key === "extend") {
+        if (r && r.active !== undefined) root.extendLive = r.active === true
+        else root.refreshExtendStatus()
       }
       if (r && r.cancelled) { root.toast("", true); return }
       if (r) root.toast(r.message || (r.ok ? "Done" : "Failed"), r.ok === true)
@@ -429,16 +483,18 @@ Item {
   readonly property int bodyGap: Style.space(10)
   readonly property int bezel: Style.space(8)
   readonly property int navH: Style.space(32)
+  readonly property int extendH: Style.space(34)
   readonly property int tileH: Style.space(58)
   readonly property int toastH: Style.space(16)
   readonly property int rowGap: Style.space(8)
-  // Even vertical rhythm: header, phone, nav keys, tiles, status line.
+  // Even vertical rhythm: header, phone, nav keys, extend display, tiles, status line.
   readonly property int tileGap: Style.space(7)
   readonly property int tilesH: 2 * tileH + tileGap
   readonly property int chromeH: pad + headerH + bodyGap + 2 * bezel + Style.space(2) + navH
-    + rowGap + tilesH + rowGap + toastH + pad
+    + rowGap + extendH + rowGap + tilesH + rowGap + toastH + pad
   readonly property int navY: bodyY + bodyH + Style.space(2)
-  readonly property int tilesY: navY + navH + rowGap
+  readonly property int extendY: navY + navH + rowGap
+  readonly property int tilesY: extendY + extendH + rowGap
   readonly property int toastY: tilesY + tilesH + rowGap
   readonly property real availableH: dock.height > 100 ? dock.height
     : (targetScreen ? targetScreen.height - Style.space(60) : 900)
@@ -986,6 +1042,121 @@ Item {
         NavKey { kind: "recents"; onClicked: root.sendKey("recents") }
       }
 
+      // -- seamless S23 Screen button + audio routing toggle ----------------
+      Row {
+        id: extendRow
+        x: root.pad
+        y: root.extendY + (1 - root.stagger(1.5)) * Style.space(10)
+        width: card.width - 2 * root.pad
+        height: root.extendH
+        spacing: Style.space(6)
+        opacity: root.stagger(1.5) * (root.busyAction === "" || root.busyAction === "extend" ? 1 : 0.45)
+
+        Rectangle {
+          id: extendButton
+          width: parent.width - audioToggleBtn.width - parent.spacing
+          height: parent.height
+          radius: Style.cornerRadius
+          scale: extendMouse.pressed ? 0.97 : 1
+          color: root.extendLive
+            ? (extendMouse.pressed ? Qt.darker(root.accent, 1.15) : root.accent)
+            : (extendMouse.pressed ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.24)
+              : (extendMouse.containsMouse || root.busyAction === "extend"
+                ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.14) : root.faint))
+          border.width: 1
+          border.color: root.extendLive || extendMouse.containsMouse || root.busyAction === "extend"
+            ? root.accent : root.hairline
+          Behavior on scale { NumberAnimation { duration: Style.duration(90); easing.type: Easing.OutQuad } }
+          Behavior on color { ColorAnimation { duration: Style.duration(140) } }
+
+          Row {
+            anchors.centerIn: parent
+            spacing: Style.space(7)
+
+            Rectangle {
+              visible: root.extendLive && root.busyAction !== "extend"
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(7); height: width; radius: width / 2
+              color: root.bg
+              SequentialAnimation on opacity {
+                running: root.opened && root.extendLive && root.busyAction !== "extend"
+                loops: Animation.Infinite
+                NumberAnimation { to: 0.3; duration: Style.duration(650); easing.type: Easing.InOutSine }
+                NumberAnimation { to: 1; duration: Style.duration(650); easing.type: Easing.InOutSine }
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.busyAction === "extend" ? "󰑐" : "󰍹"
+              color: root.extendLive ? root.bg : root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.iconLarge
+              RotationAnimator on rotation {
+                running: root.busyAction === "extend"
+                from: 0; to: 360; duration: 850
+                loops: Animation.Infinite
+                onRunningChanged: if (!running) parent.rotation = 0
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.busyAction === "extend" ? "Starting S23 Screen…"
+                : (root.extendLive ? "S23 Screen live · Click to stop" : "S23 Screen")
+              color: root.extendLive ? root.bg : root.fg
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption + 1
+              font.bold: true
+            }
+          }
+
+          MouseArea {
+            id: extendMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            enabled: root.busyAction === ""
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.toggleExtendDisplay(false)
+          }
+        }
+
+        Rectangle {
+          id: audioToggleBtn
+          width: root.extendH
+          height: parent.height
+          radius: Style.cornerRadius
+          scale: audioMouse.pressed ? 0.94 : 1
+          color: root.extendAudio
+            ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22)
+            : (audioMouse.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : root.faint)
+          border.width: 1
+          border.color: root.extendAudio || audioMouse.containsMouse ? root.accent : root.hairline
+          Behavior on scale { NumberAnimation { duration: Style.duration(90); easing.type: Easing.OutQuad } }
+          Behavior on color { ColorAnimation { duration: Style.duration(140) } }
+
+          Text {
+            textFormat: Text.PlainText
+            anchors.centerIn: parent
+            text: root.extendAudio ? "󰕾" : "󰖁"
+            color: root.extendAudio ? root.accent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.iconLarge
+          }
+
+          MouseArea {
+            id: audioMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            enabled: root.busyAction === ""
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.toggleExtendAudio()
+          }
+        }
+      }
+
       // -- actions -------------------------------------------------------------
       Grid {
         id: tiles
@@ -1037,7 +1208,8 @@ Item {
         color: root.toastText === "" ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.38)
           : (root.toastOk ? root.accent : root.urgent)
         text: root.toastText !== "" ? (root.toastOk ? "󰄬  " : "󰀦  ") + root.toastText
-          : "Drop files on the screen to send them too"
+          : (!root.extendPaired ? "New: S23 Screen · Click above to set up 2nd display"
+            : "Drop files on the screen to send them too")
       }
     }
   }

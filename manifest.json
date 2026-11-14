@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "io.github.arbabmujtaba.omaecosystem",
   "name": "OmaEcosystem",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "arbabmujtaba",
   "license": "MIT",
-  "description": "Your Android phone as part of the desktop: a dock on the right with its live, controllable screen one Connect away (scrcpy over USB or wireless ADB), with clipboard both ways, file sending, phone screenshots, link handoff, notifications and one-click hotspot. Keeps wireless ADB ready in the background.",
+  "description": "Your Android phone as part of the desktop: a dock on the right with its live, controllable screen (scrcpy over USB or wireless ADB), plus S23 Screen to extend your desktop onto your phone wirelessly or over USB with optional audio routing, clipboard sync, file sending, screenshots, link handoff and one-click hotspot.",
   "kinds": [
     "bar-widget",
     "panel"
@@ -27,6 +27,7 @@
       "reserveSpace": false,
       "phoneScreenOff": false,
       "keepWireless": true,
+      "extendAudio": false,
       "hotspotBluetooth": "",
       "hotspotWifi": ""
     },
@@ -61,6 +62,13 @@
         "label": "Keep wireless mirroring ready",
         "description": "In the background, reconnect wireless ADB and switch a plugged-in phone to wireless so you can unplug it.",
         "defaultValue": true
+      },
+      {
+        "key": "extendAudio",
+        "type": "boolean",
+        "label": "Route audio to phone (S23 Screen)",
+        "description": "Stream laptop audio to your phone while using it as an extended display. Off keeps audio on your laptop.",
+        "defaultValue": false
       },
       {
         "key": "hotspotBluetooth",
