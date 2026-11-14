@@ -5,7 +5,7 @@
   "version": "1.2.0",
   "author": "arbabmujtaba",
   "license": "MIT",
-  "description": "Your Android phone as part of the desktop: a dock on the right with its live, controllable screen (scrcpy over USB or wireless ADB), plus S23 Screen to extend your desktop onto your phone wirelessly or over USB with optional audio routing, clipboard sync, file sending, screenshots, link handoff and one-click hotspot.",
+  "description": "Your Android phone as part of the desktop: a dock on the right with its live, controllable screen (scrcpy over USB or wireless ADB), plus Extend Screen to use your phone as a seamless 2nd monitor wirelessly or over USB with optional audio routing, clipboard sync, file sending, screenshots, link handoff and one-click hotspot.",
   "kinds": [
     "bar-widget",
     "panel"
@@ -28,6 +28,7 @@
       "phoneScreenOff": false,
       "keepWireless": true,
       "extendAudio": false,
+      "extendScale": 2.0,
       "hotspotBluetooth": "",
       "hotspotWifi": ""
     },
@@ -66,9 +67,19 @@
       {
         "key": "extendAudio",
         "type": "boolean",
-        "label": "Route audio to phone (S23 Screen)",
+        "label": "Route audio to phone (Extend Screen)",
         "description": "Stream laptop audio to your phone while using it as an extended display. Off keeps audio on your laptop.",
         "defaultValue": false
+      },
+      {
+        "key": "extendScale",
+        "type": "number",
+        "label": "Display scale (Extend Screen)",
+        "description": "UI scaling on the phone screen. Higher values make text and windows bigger and easier to read.",
+        "defaultValue": 2.0,
+        "min": 1.0,
+        "max": 3.0,
+        "step": 0.25
       },
       {
         "key": "hotspotBluetooth",

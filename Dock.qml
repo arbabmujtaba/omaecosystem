@@ -103,6 +103,10 @@ Item {
   readonly property string hotspotWifi: String(setting("hotspotWifi", "") || "").trim()
   readonly property bool keepWireless: setting("keepWireless", true) !== false
   readonly property bool extendAudioSetting: setting("extendAudio", false) === true
+  readonly property real extendScaleSetting: {
+    var n = Number(setting("extendScale", 2.0))
+    return isFinite(n) ? Math.max(1.0, Math.min(3.0, n)) : 2.0
+  }
   onExtendAudioSettingChanged: extendAudio = extendAudioSetting
   Component.onCompleted: extendAudio = extendAudioSetting
 
@@ -287,13 +291,18 @@ Item {
   property bool extendLive: false
   property bool extendAudio: false
   property bool extendPaired: true
+  property bool showExtendGuide: false
+  readonly property string extendLabel: root.device && root.device.name && root.device.name !== "Phone"
+    ? (root.device.name + " Screen") : "Phone Screen"
 
   function refreshExtendStatus() {
     if (!extendStatusProc.running) extendStatusProc.running = true
   }
 
   function toggleExtendDisplay(restart) {
-    var args = ["extend-display", extendAudio ? "--audio" : "--no-audio"]
+    showExtendGuide = false
+    var args = ["extend-display", extendAudio ? "--audio" : "--no-audio",
+                "--scale", String(extendScaleSetting)]
     if (restart) args.push("--restart")
     runAction("extend", args)
   }
@@ -304,7 +313,7 @@ Item {
     if (extendLive) {
       toggleExtendDisplay(true)
     } else {
-      toast(extendAudio ? "S23 Screen audio: Phone" : "S23 Screen audio: Laptop", true)
+      toast(extendAudio ? "Extended display audio: Phone" : "Extended display audio: Laptop", true)
     }
   }
 
@@ -400,6 +409,8 @@ Item {
       if (key === "extend") {
         if (r && r.active !== undefined) root.extendLive = r.active === true
         else root.refreshExtendStatus()
+        if (r && r.code === "extend-setup") root.showExtendGuide = true
+        else if (r && r.ok) root.showExtendGuide = false
       }
       if (r && r.cancelled) { root.toast("", true); return }
       if (r) root.toast(r.message || (r.ok ? "Done" : "Failed"), r.ok === true)
@@ -804,17 +815,17 @@ Item {
           border.color: Qt.rgba(1, 1, 1, 0.08)
         }
 
-        // First-time setup guide, shown in place of the error.
+          // First-time setup guide, shown in place of the error (ADB or Extend Screen).
         Column {
           id: guide
-          visible: root.showGuide
+          visible: root.showGuide || root.showExtendGuide
           anchors.centerIn: parent
           width: parent.width - Style.space(30)
           spacing: Style.space(9)
 
           Text {
             textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
-            text: "󰄜"
+            text: root.showExtendGuide ? "󰍹" : "󰄜"
             color: root.accent
             font.family: root.fontFamily
             font.pixelSize: Style.space(34)
@@ -823,7 +834,8 @@ Item {
             textFormat: Text.PlainText  // never parse phone/clipboard text as HTML
             width: parent.width
             wrapMode: Text.WordWrap
-            text: root.phaseCode === "missing-tool" ? "One thing to install" : "Let's connect your phone"
+            text: root.showExtendGuide ? "Set up Extend Screen"
+              : (root.phaseCode === "missing-tool" ? "One thing to install" : "Let's connect your phone")
             color: "#ffffff"
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
@@ -832,7 +844,7 @@ Item {
 
           // USB is the recommended path, say so up front.
           Rectangle {
-            visible: root.phaseCode !== "missing-tool"
+            visible: !root.showExtendGuide && root.phaseCode !== "missing-tool"
             width: parent.width
             height: usbTip.implicitHeight + Style.space(12)
             radius: Style.space(6)
@@ -853,14 +865,19 @@ Item {
           }
 
           Repeater {
-            model: root.phaseCode === "missing-tool"
+            model: root.showExtendGuide
+              ? ["Install Sunshine on your laptop: omarchy pkg add sunshine",
+                 "Install Moonlight on your Android phone (Play Store or F-Droid).",
+                 "If ufw firewall is active, allow Sunshine ports on your LAN/hotspot.",
+                 "Click Extend Screen again and pair once at https://localhost:47990."]
+              : (root.phaseCode === "missing-tool"
               ? [root.phaseMessage, "Then press Try again."]
               : root.phaseCode === "unauthorized"
               ? ["Unlock the phone.", "Tap Allow on “Allow USB debugging?” (tick Always allow).", "Press Try again."]
               : ["On the phone: Settings › About phone › Software information, tap Build number 7 times.",
                  "Settings › Developer options › turn on USB debugging.",
                  "Plug the phone into the laptop and tap Allow on the phone.",
-                 "Wireless instead: turn on Wireless debugging, then run adb pair once."]
+                 "Wireless instead: turn on Wireless debugging, then run adb pair once."])
             delegate: Row {
               required property var modelData
               required property int index
@@ -913,13 +930,13 @@ Item {
               id: guideMouse
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: root.retry()
+              onClicked: root.showExtendGuide ? root.toggleExtendDisplay(false) : root.retry()
             }
           }
         }
 
         Column {
-          visible: !root.showGuide
+          visible: !root.showGuide && !root.showExtendGuide
           anchors.centerIn: parent
           width: parent.width - Style.space(36)
           spacing: Style.space(14)
@@ -1042,7 +1059,7 @@ Item {
         NavKey { kind: "recents"; onClicked: root.sendKey("recents") }
       }
 
-      // -- seamless S23 Screen button + audio routing toggle ----------------
+      // -- seamless Extend Screen button + audio routing toggle ----------------
       Row {
         id: extendRow
         x: root.pad
@@ -1054,7 +1071,7 @@ Item {
 
         Rectangle {
           id: extendButton
-          width: parent.width - audioToggleBtn.width - parent.spacing
+          width: parent.width - audioToggleBtn.width - setupGuideBtn.width - parent.spacing * 2
           height: parent.height
           radius: Style.cornerRadius
           scale: extendMouse.pressed ? 0.97 : 1
@@ -1071,7 +1088,9 @@ Item {
 
           Row {
             anchors.centerIn: parent
+            width: Math.min(parent.width - Style.space(12), extendContent.implicitWidth)
             spacing: Style.space(7)
+            id: extendContent
 
             Rectangle {
               visible: root.extendLive && root.busyAction !== "extend"
@@ -1104,8 +1123,10 @@ Item {
             Text {
               textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
-              text: root.busyAction === "extend" ? "Starting S23 Screen…"
-                : (root.extendLive ? "S23 Screen live · Click to stop" : "S23 Screen")
+              width: Math.min(implicitWidth, extendButton.width - Style.space(42))
+              elide: Text.ElideRight
+              text: root.busyAction === "extend" ? ("Starting " + root.extendLabel + "…")
+                : (root.extendLive ? (root.extendLabel + " live · Stop") : root.extendLabel)
               color: root.extendLive ? root.bg : root.fg
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption + 1
@@ -1153,6 +1174,39 @@ Item {
             enabled: root.busyAction === ""
             cursorShape: Qt.PointingHandCursor
             onClicked: root.toggleExtendAudio()
+          }
+        }
+
+        Rectangle {
+          id: setupGuideBtn
+          width: root.extendH
+          height: parent.height
+          radius: Style.cornerRadius
+          scale: setupGuideMouse.pressed ? 0.94 : 1
+          color: root.showExtendGuide
+            ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.22)
+            : (setupGuideMouse.containsMouse ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12) : root.faint)
+          border.width: 1
+          border.color: root.showExtendGuide || setupGuideMouse.containsMouse ? root.accent : root.hairline
+          Behavior on scale { NumberAnimation { duration: Style.duration(90); easing.type: Easing.OutQuad } }
+          Behavior on color { ColorAnimation { duration: Style.duration(140) } }
+
+          Text {
+            textFormat: Text.PlainText
+            anchors.centerIn: parent
+            text: "󰋗"
+            color: root.showExtendGuide ? root.accent : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.iconLarge
+          }
+
+          MouseArea {
+            id: setupGuideMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            enabled: root.busyAction === ""
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.showExtendGuide = !root.showExtendGuide
           }
         }
       }
@@ -1208,7 +1262,7 @@ Item {
         color: root.toastText === "" ? Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.38)
           : (root.toastOk ? root.accent : root.urgent)
         text: root.toastText !== "" ? (root.toastOk ? "󰄬  " : "󰀦  ") + root.toastText
-          : (!root.extendPaired ? "New: S23 Screen · Click above to set up 2nd display"
+          : (!root.extendPaired ? ("New: " + root.extendLabel + " · Click ? for setup steps")
             : "Drop files on the screen to send them too")
       }
     }

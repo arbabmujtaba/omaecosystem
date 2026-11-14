@@ -21,8 +21,8 @@ exactly inside the frame's screen hole, and does the one-click actions.
     omaecosystem hotspot [--bt-mac MAC] [--wifi NAME]
                                           wake the phone's hotspot over Bluetooth and join it
     omaecosystem extend-display [--audio|--no-audio] [--hotspot] [--usb] [--restart]
-                                          toggle S23 Screen extended display (USB or hotspot)
-    omaecosystem extend-status            report whether S23 Screen is currently active
+                                          toggle Phone Screen extended display (USB or hotspot)
+    omaecosystem extend-status            report whether Phone Screen is currently active
     omaecosystem keeper [--once]             keep wireless ADB connected (the dock runs this
                                           in the background; stops when stdin closes)
 
@@ -1239,6 +1239,14 @@ def sunshine_has_paired_clients() -> bool:
         return False
 
 
+def device_screen_label(cache: dict | None = None) -> str:
+    c = cache if cache is not None else read_cache()
+    name = clean_text(str(c.get("name") or c.get("model") or ""), 32)
+    if name and name.lower() != "phone":
+        return f"{name} Screen"
+    return "Phone Screen"
+
+
 def maybe_notify_new_feature(force: bool = False) -> bool:
     cache = read_cache()
     if not force and cache.get("featureNotifiedVersion") == FEATURE_VERSION:
@@ -1248,13 +1256,13 @@ def maybe_notify_new_feature(force: bool = False) -> bool:
         return False
     if shutil.which("notify-send"):
         run(["notify-send", "-a", "OmaEcosystem", "-i", "video-display",
-             "New in OmaEcosystem: S23 Screen",
-             "Extend your desktop onto your phone wirelessly (hotspot) or via USB. "
-             "Click S23 Screen in the phone dock to set up."], timeout=5)
+             "New in OmaEcosystem: Extend Screen",
+             "Use any Android phone as a wireless or USB 2nd monitor. "
+             "Open the phone dock and click Extend Screen to set up."], timeout=5)
     return True
 
 
-def shell_extend_audio_setting() -> bool:
+def shell_plugin_setting(name: str, fallback):
     try:
         with open(SHELL_JSON_PATH, encoding="utf-8") as f:
             cfg = json.load(f)
@@ -1262,14 +1270,51 @@ def shell_extend_audio_setting() -> bool:
         for section in layout.values():
             if isinstance(section, list):
                 for item in section:
-                    if isinstance(item, dict) and item.get("id") == PLUGIN_ID and "extendAudio" in item:
-                        return bool(item["extendAudio"])
+                    if isinstance(item, dict) and item.get("id") == PLUGIN_ID and name in item:
+                        return item[name]
         for item in cfg.get("plugins") or []:
-            if isinstance(item, dict) and item.get("id") == PLUGIN_ID and "extendAudio" in item:
-                return bool(item["extendAudio"])
+            if isinstance(item, dict) and item.get("id") == PLUGIN_ID and name in item:
+                return item[name]
     except (OSError, ValueError):
         pass
-    return False
+    return fallback
+
+
+def shell_extend_audio_setting() -> bool:
+    return bool(shell_plugin_setting("extendAudio", False))
+
+
+def shell_extend_scale_setting() -> float:
+    try:
+        v = float(shell_plugin_setting("extendScale", 2.0))
+        if 1.0 <= v <= 3.0:
+            return v
+    except (TypeError, ValueError):
+        pass
+    return 2.0
+
+
+def clean_scale(scale: float, width: int, height: int) -> float:
+    import math
+    g = math.gcd(width * 120, height * 120)
+    k = max(120, min(g, int(round(scale * 120))))
+    while g % k != 0:
+        k += 1
+    return round(k / 120.0, 6)
+
+
+def default_extend_mode(cache: dict) -> str:
+    try:
+        w, h = int(cache.get("width", 0)), int(cache.get("height", 0))
+    except (TypeError, ValueError):
+        w = h = 0
+    if w >= 480 and h >= 480:
+        lw, lh = max(w, h), min(w, h)
+        # Keep even dimensions for H.264 4:2:0 encoding
+        lw -= lw % 2
+        lh -= lh % 2
+        return f"{lw}x{lh}@60"
+    return "1920x1080@60"
 
 
 def ensure_sunshine_config() -> str:
@@ -1284,7 +1329,7 @@ def ensure_sunshine_config() -> str:
     if not os.path.isfile(apps_path):
         with open(apps_path, "w", encoding="utf-8") as f:
             json.dump({"env": {"PATH": "$(PATH):$(HOME)/.local/bin"},
-                       "apps": [{"name": "S23 Screen", "image-path": "desktop.png"}]}, f, indent=2)
+                       "apps": [{"name": "Phone Screen", "image-path": "desktop.png"}]}, f, indent=2)
     return conf_path
 
 
@@ -1450,7 +1495,7 @@ def extend_stop() -> None:
         pass
 
 
-def launch_moonlight_for_s23(serial: str) -> None:
+def launch_moonlight_for_phone(serial: str) -> None:
     if not serial or not shutil.which("adb"):
         return
     pkgs = adb(serial, "shell", "pm list packages com.limelight", timeout=5).stdout.decode(errors="replace")
@@ -1458,7 +1503,7 @@ def launch_moonlight_for_s23(serial: str) -> None:
         return
     adb(serial, "shell", "input keyevent KEYCODE_WAKEUP", timeout=4)
     adb(serial, "shell", "monkey -p com.limelight -c android.intent.category.LAUNCHER 1", timeout=5)
-    # Best-effort background auto-tap into S23 Screen if Moonlight is at PcView/AppView.
+    # Best-effort background auto-tap into Phone Screen if Moonlight is at PcView/AppView.
     host = socket.gethostname() or "arch"
     script = r'''
 serial="$1"; host="$2"
@@ -1472,7 +1517,7 @@ xml_s, host = sys.argv[1], sys.argv[2]
 m = re.search(r"<\?xml.*?</hierarchy>", xml_s, re.S)
 if not m: sys.exit(0)
 root = ET.fromstring(m.group(0))
-for target in ("S23 Screen", host):
+for target in ("Phone Screen", "Desktop", host):
     for node in root.iter("node"):
         if node.attrib.get("package") == "com.limelight" and node.attrib.get("text") == target:
             nums = [int(x) for x in re.findall(r"\d+", node.attrib.get("bounds", ""))]
@@ -1491,16 +1536,20 @@ done
                      stdin=subprocess.DEVNULL, start_new_session=True)
 
 
-def extend_start(pos: str = "right", mode: str = "1920x1080@60", scale: float = 1.25,
+def extend_start(pos: str = "right", mode: str = "", scale: float | None = None,
                  route_audio: bool = False, use_hotspot: bool = False, use_usb: bool = False,
                  explicit_serial: str = "") -> str:
     if not shutil.which("hyprctl"):
-        raise DockError("hyprctl is required for S23 Screen", "missing-tool")
+        raise DockError("hyprctl is required for Extend Screen", "missing-tool")
     if not shutil.which("sunshine"):
-        raise DockError("Install sunshine (omarchy pkg add sunshine) and Moonlight on your phone to use S23 Screen",
+        raise DockError("Install sunshine (omarchy pkg add sunshine) and Moonlight on your phone",
                         "extend-setup")
 
     cfg, cache = load_config(), read_cache()
+    if not mode:
+        mode = default_extend_mode(cache)
+    if scale is None:
+        scale = shell_extend_scale_setting()
     usbs = usb_tether_ips()
 
     if use_usb and not usbs:
@@ -1533,8 +1582,10 @@ def extend_start(pos: str = "right", mode: str = "1920x1080@60", scale: float = 
 
     h_res = mode.split("@", 1)[0]
     hw_s, hh_s = h_res.split("x", 1)
-    h_lw = round(int(hw_s) / scale)
-    h_lh = round(int(hh_s) / scale)
+    hw_i, hh_i = int(hw_s), int(hh_s)
+    scale = clean_scale(scale, hw_i, hh_i)
+    h_lw = round(hw_i / scale)
+    h_lh = round(hh_i / scale)
 
     before = {str(m.get("name", "")) for m in monitors if str(m.get("name", "")).startswith("HEADLESS")}
     run(["hyprctl", "output", "create", "headless"], timeout=5, check=True)
@@ -1547,7 +1598,7 @@ def extend_start(pos: str = "right", mode: str = "1920x1080@60", scale: float = 
             break
         time.sleep(0.1)
     if not re.fullmatch(r"HEADLESS-\d+", vout):
-        raise DockError("Could not create virtual S23 Screen output")
+        raise DockError("Could not create virtual phone display output")
 
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(HEADLESS_OUT_PATH, "w", encoding="utf-8") as f:
@@ -1568,7 +1619,7 @@ def extend_start(pos: str = "right", mode: str = "1920x1080@60", scale: float = 
     conf_path = ensure_sunshine_config()
     audio_val = "enabled" if route_audio else "disabled"
     logf = open(EXTEND_LOG_PATH, "a", encoding="utf-8")
-    logf.write(f"--- {time.strftime('%F %T')} S23 Screen ({vout} {mode} scale={scale} pos={pos} audio={audio_val}) ---\n")
+    logf.write(f"--- {time.strftime('%F %T')} Phone Screen ({vout} {mode} scale={scale} pos={pos} audio={audio_val}) ---\n")
     logf.flush()
     proc = subprocess.Popen(
         ["sunshine", conf_path, f"output_name={vout}", f"stream_audio={audio_val}"],
@@ -1591,14 +1642,15 @@ def extend_start(pos: str = "right", mode: str = "1920x1080@60", scale: float = 
         raise DockError("Sunshine did not start listening on port 47989")
 
     serial = explicit_serial or ready_serial(cfg.get("serial", ""))
-    launch_moonlight_for_s23(serial)
+    launch_moonlight_for_phone(serial)
+    label = device_screen_label(cache)
     paired = sunshine_has_paired_clients()
     if not paired:
         if shutil.which("xdg-open"):
             subprocess.Popen(["xdg-open", "https://localhost:47990"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              stdin=subprocess.DEVNULL, start_new_session=True)
-        notify("S23 Screen ready for first-time pairing: install Moonlight on your phone and pair at https://localhost:47990")
+        notify(f"{label} ready to pair: open Moonlight on your phone and pair at https://localhost:47990")
     return extend_connection_summary(cfg, read_cache())
 
 
@@ -1606,29 +1658,33 @@ def cmd_extend_status(a) -> int:
     active, _, detail = query_extend_status()
     audio = shell_extend_audio_setting()
     paired = sunshine_has_paired_clients()
-    msg = f"S23 Screen active · {detail}" if active and detail else ("S23 Screen active" if active else "S23 Screen off")
-    emit({"ok": True, "active": active, "audio": audio, "paired": paired, "detail": detail, "message": msg})
+    label = device_screen_label()
+    msg = f"{label} active · {detail}" if active and detail else (f"{label} active" if active else f"{label} off")
+    emit({"ok": True, "active": active, "audio": audio, "paired": paired,
+          "label": label, "detail": detail, "message": msg})
     return 0
 
 
 def cmd_extend_display(a) -> int:
     active, _, _ = query_extend_status()
     route_audio = shell_extend_audio_setting() if a.audio is None else a.audio
+    label = device_screen_label()
     if active and not getattr(a, "restart", False):
-        emit({"event": "progress", "message": "Stopping S23 Screen…"})
+        emit({"event": "progress", "message": f"Stopping {label}…"})
         extend_stop()
-        emit({"ok": True, "active": False, "audio": route_audio, "detail": "", "message": "S23 Screen turned off"})
+        emit({"ok": True, "active": False, "audio": route_audio, "label": label,
+              "detail": "", "message": f"{label} turned off"})
         return 0
     if active and getattr(a, "restart", False):
-        emit({"event": "progress", "message": "Updating S23 Screen audio…"})
+        emit({"event": "progress", "message": f"Updating {label} audio…"})
         extend_stop()
     else:
-        emit({"event": "progress", "message": "Starting S23 Screen…"})
+        emit({"event": "progress", "message": f"Starting {label}…"})
     detail = extend_start(pos=a.pos, mode=a.mode, scale=a.scale, route_audio=route_audio,
                           use_hotspot=a.hotspot, use_usb=a.usb, explicit_serial=a.serial)
     audio_note = "Audio: Phone" if route_audio else "Audio: Laptop"
-    emit({"ok": True, "active": True, "audio": route_audio, "detail": detail,
-          "message": f"S23 Screen live · {audio_note} · {detail}"})
+    emit({"ok": True, "active": True, "audio": route_audio, "label": label, "detail": detail,
+          "message": f"{label} live · {audio_note} · {detail}"})
     return 0
 
 
@@ -1678,8 +1734,8 @@ def main() -> int:
     ed.add_argument("--usb", action="store_true")
     ed.add_argument("--restart", action="store_true")
     ed.add_argument("--pos", default="right", choices=("right", "left", "above", "below"))
-    ed.add_argument("--mode", default="1920x1080@60")
-    ed.add_argument("--scale", type=float, default=1.25)
+    ed.add_argument("--mode", default="")
+    ed.add_argument("--scale", type=float, default=None)
     add("extend-status", cmd_extend_status)
     kp = add("keeper", cmd_keeper)
     kp.add_argument("--once", action="store_true")

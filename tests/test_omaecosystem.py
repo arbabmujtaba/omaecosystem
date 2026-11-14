@@ -553,43 +553,54 @@ class HotspotRun(unittest.TestCase):
 
 
 class ExtendDisplay(unittest.TestCase):
-    def test_extend_status_reports_active_and_detail(self):
+    def test_extend_status_reports_dynamic_device_label(self):
         events = []
         with mock.patch.object(eco, "query_extend_status", return_value=(True, "HEADLESS-1", "Hotspot: 10.0.0.1")), \
              mock.patch.object(eco, "shell_extend_audio_setting", return_value=False), \
+             mock.patch.object(eco, "sunshine_has_paired_clients", return_value=True), \
+             mock.patch.object(eco, "read_cache", return_value={"name": "Pixel 8"}), \
              mock.patch.object(eco, "emit", side_effect=events.append):
             self.assertEqual(eco.cmd_extend_status(mock.Mock(serial="")), 0)
         self.assertTrue(events[-1]["active"])
         self.assertFalse(events[-1]["audio"])
-        self.assertIn("S23 Screen", events[-1]["message"])
+        self.assertEqual(events[-1]["label"], "Pixel 8 Screen")
+        self.assertIn("Pixel 8 Screen", events[-1]["message"])
         self.assertNotIn("HEADLESS", events[-1]["message"])
+
+    def test_default_extend_mode_and_clean_scale_for_any_phone(self):
+        self.assertEqual(eco.default_extend_mode({"width": 1080, "height": 2316}), "2316x1080@60")
+        self.assertEqual(eco.default_extend_mode({"width": 1080, "height": 2400}), "2400x1080@60")
+        self.assertEqual(eco.default_extend_mode({}), "1920x1080@60")
+        self.assertEqual(eco.clean_scale(2.0, 2316, 1080), 2.0)
 
     def test_extend_display_toggles_off_and_on_with_audio_option(self):
         events = []
         with mock.patch.object(eco, "query_extend_status", return_value=(True, "HEADLESS-1", "")), \
              mock.patch.object(eco, "shell_extend_audio_setting", return_value=False), \
+             mock.patch.object(eco, "read_cache", return_value={"name": "My Phone"}), \
              mock.patch.object(eco, "extend_stop") as stop_mock, \
              mock.patch.object(eco, "emit", side_effect=events.append):
             args = mock.Mock(serial="", audio=None, restart=False, hotspot=False, usb=False,
-                             pos="right", mode="1920x1080@60", scale=1.25)
+                             pos="right", mode="", scale=None)
             self.assertEqual(eco.cmd_extend_display(args), 0)
         stop_mock.assert_called_once()
         self.assertFalse(events[-1]["active"])
-        self.assertIn("S23 Screen", events[-1]["message"])
+        self.assertIn("My Phone Screen", events[-1]["message"])
 
         events.clear()
         with mock.patch.object(eco, "query_extend_status", return_value=(False, "", "")), \
+             mock.patch.object(eco, "read_cache", return_value={"name": "My Phone"}), \
              mock.patch.object(eco, "extend_start", return_value="Hotspot: 10.0.0.1") as start_mock, \
              mock.patch.object(eco, "emit", side_effect=events.append):
             args = mock.Mock(serial="", audio=True, restart=False, hotspot=False, usb=False,
-                             pos="right", mode="1920x1080@60", scale=1.25)
+                             pos="right", mode="", scale=2.0)
             self.assertEqual(eco.cmd_extend_display(args), 0)
         self.assertTrue(start_mock.call_args.kwargs["route_audio"])
         self.assertTrue(events[-1]["active"])
         self.assertTrue(events[-1]["audio"])
         self.assertIn("Audio: Phone", events[-1]["message"])
 
-    def test_ensure_sunshine_config_creates_s23_screen_defaults(self):
+    def test_ensure_sunshine_config_creates_generic_phone_screen_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(eco, "SUNSHINE_CONF_DIR", tmp):
                 conf = eco.ensure_sunshine_config()
@@ -597,7 +608,7 @@ class ExtendDisplay(unittest.TestCase):
                     self.assertIn("stream_audio = disabled", f.read())
                 with open(os.path.join(tmp, "apps.json"), encoding="utf-8") as f:
                     apps = json.load(f)
-                self.assertEqual(apps["apps"][0]["name"], "S23 Screen")
+                self.assertEqual(apps["apps"][0]["name"], "Phone Screen")
 
     def test_missing_sunshine_explains_community_setup(self):
         with mock.patch.object(eco.shutil, "which", side_effect=lambda t: None if t == "sunshine" else "/usr/bin/" + t):
@@ -617,7 +628,7 @@ class ExtendDisplay(unittest.TestCase):
                 self.assertTrue(eco.maybe_notify_new_feature())
                 self.assertFalse(eco.maybe_notify_new_feature())
             self.assertEqual(run_mock.call_count, 1)
-            self.assertIn("S23 Screen", run_mock.call_args.args[0][-2])
+            self.assertIn("Extend Screen", run_mock.call_args.args[0][-2])
 
 
 class Keeper(unittest.TestCase):

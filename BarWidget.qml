@@ -40,7 +40,7 @@ BarWidget {
     text: "󰄜"
     active: root.docked
     useActiveColor: false
-    tooltipText: root.docked ? "Undock phone · Right-click: S23 Screen" : "Dock phone · Right-click: S23 Screen"
+    tooltipText: root.docked ? "Undock phone · Right-click: Extend screen" : "Dock phone · Right-click: Extend screen"
     onPressed: function(b) {
       if (b === Qt.RightButton || b === Qt.MiddleButton) root.toggleExtendDisplay()
       else root.toggleDock()

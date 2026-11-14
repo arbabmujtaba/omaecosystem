@@ -11,7 +11,7 @@ just grab the clipboard or send a file.
 ## Features
 
 - **Live, controllable screen** (scrcpy over wireless ADB), pinned on every workspace
-- **S23 Screen (Extended Display)**: turn your phone into a seamless 2nd monitor on the right of your laptop (virtual Hyprland display + Sunshine/Moonlight) over USB tethering or phone hotspot, with one-click speaker toggle (`Audio: Laptop` / `Audio: Phone`)
+- **Extend Screen (2nd Monitor)**: turn any Android phone into a seamless 2nd monitor on the right of your laptop (virtual Hyprland display + Sunshine/Moonlight) at your phone's native aspect ratio, over USB tethering or phone hotspot, with one-click speaker toggle (`Audio: Laptop` / `Audio: Phone`)
 - **To phone**: copy the laptop clipboard to the phone. Copied files and images are sent as files
 - **From phone**: copy the phone's clipboard to the laptop
 - **Send files**: pick files and they go to the phone's `Download` folder. Name clashes get ` (1)`. You can also drop files onto the screen
@@ -34,17 +34,24 @@ python3 -m unittest discover -s tests   # no phone or Hyprland needed
 uses `bluez-utils` (bluetoothctl) and NetworkManager, which Omarchy ships.
 Nothing else: the plugin does not need phone-mirror or any config file.
 
-For **S23 Screen (Extended Display)**: `sunshine` on the laptop (`omarchy pkg add sunshine`)
-and **Moonlight** on your phone.
+For **Extend Screen (2nd Monitor)**: `sunshine` on the laptop (`omarchy pkg add sunshine`)
+and **Moonlight** on your phone (Play Store or F-Droid).
 
-## S23 Screen (Extended Display)
+## Extend Screen (2nd Monitor Setup)
 
-Click **S23 Screen** inside the dock (or right-click the phone bar icon) to
-extend your Hyprland desktop onto your phone:
+Turn any Android phone into a real extended Hyprland display (your mouse cursor glides off the right edge of your laptop screen onto the phone). Click `?` beside the **Phone Screen** button inside the dock to view these steps anytime:
 
-- **Wireless or USB:** uses USB tethering automatically when plugged in, or wakes your phone's hotspot over Bluetooth and joins it wirelessly.
-- **Audio toggle:** keeps laptop audio on your laptop speakers by default; click the speaker icon beside **S23 Screen** (or set `extendAudio`) to route audio to the phone.
-- **First-time pairing:** on first click, Sunshine opens `https://localhost:47990` so you can create a local login and enter Moonlight's 4-digit PIN once. If `ufw` is active, allow Sunshine's private-network ports (`47984,47989,48010/tcp` and `47998,47999,48000,48002,48010/udp` on RFC1918 subnets).
+1. **Install Sunshine & Moonlight:** run `omarchy pkg add sunshine` on your laptop and install **Moonlight** on your phone.
+2. **Allow firewall ports (if `ufw` is active):**
+   ```sh
+   for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+     sudo ufw allow from "$net" to any port 47984,47989,48010 proto tcp
+     sudo ufw allow from "$net" to any port 47998,47999,48000,48002,48010 proto udp
+   done
+   ```
+3. **One-time pairing:** click the **Phone Screen** button in the dock (or right-click the bar icon). Sunshine opens `https://localhost:47990` — create a local login, tap your PC in Moonlight on your phone, and enter the 4-digit PIN.
+4. **Full-screen clarity:** OmaEcosystem auto-detects your phone's native resolution and defaults to `extendScale: 2.0` so text is readable. In Moonlight's Android settings, enable **Stretch video to full screen** (or set Resolution to **Native**) to remove any side black bars.
+5. **Wireless or USB & Audio:** uses USB tethering automatically when plugged in, or wakes your phone's hotspot over Bluetooth wirelessly. Audio stays on your laptop by default; click the speaker icon (`󰖁` / `󰕾`) or set `extendAudio` to route audio to the phone.
 
 ## First-time setup
 
@@ -126,7 +133,8 @@ omarchy bar set io.github.arbabmujtaba.omaecosystem screenInches 5 --json      #
 omarchy bar set io.github.arbabmujtaba.omaecosystem reserveSpace true --json   # tile windows beside it
 omarchy bar set io.github.arbabmujtaba.omaecosystem phoneScreenOff true --json # phone display dark while docked
 omarchy bar set io.github.arbabmujtaba.omaecosystem keepWireless false --json  # no background ADB keeper
-omarchy bar set io.github.arbabmujtaba.omaecosystem extendAudio true --json    # route audio to phone on S23 Screen
+omarchy bar set io.github.arbabmujtaba.omaecosystem extendAudio true --json    # route audio to phone on Extend Screen
+omarchy bar set io.github.arbabmujtaba.omaecosystem extendScale 2.0 --json     # UI scaling on phone (1.0-3.0)
 omarchy bar set io.github.arbabmujtaba.omaecosystem hotspotBluetooth AA:BB:CC:DD:EE:FF
 omarchy bar set io.github.arbabmujtaba.omaecosystem hotspotWifi "My hotspot"   # Wi-Fi connection name or SSID
 ```
